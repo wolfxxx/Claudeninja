@@ -6,6 +6,8 @@ export class Input {
   readonly keys = new Set<string>();
 
   pointerLocked = false;
+  /** Set when the browser refuses pointer lock (e.g. inside a sandboxed frame): drag-to-look instead. */
+  lockUnavailable = false;
 
   private mouseDX = 0;
   private mouseDY = 0;
@@ -35,6 +37,29 @@ export class Input {
     this.onPointerLockChange = this.onPointerLockChange.bind(this);
     this.onContextMenu = this.onContextMenu.bind(this);
     this.onBlur = this.onBlur.bind(this);
+    this.onLockError = this.onLockError.bind(this);
+  }
+
+  /** Clicks attack when the pointer is captured, or when capture isn't possible at all. */
+  private get canAct(): boolean {
+    return this.pointerLocked || this.lockUnavailable;
+  }
+
+  private tryLock(): void {
+    if (this.pointerLocked || this.lockUnavailable) return;
+    try {
+      const result = this.canvas.requestPointerLock() as unknown;
+      if (result instanceof Promise) result.catch(() => this.onLockError());
+    } catch {
+      this.onLockError();
+    }
+  }
+
+  private onLockError(): void {
+    if (this.lockUnavailable) return;
+    this.lockUnavailable = true;
+    this.hintEl?.classList.add("is-hidden");
+    this.onLockChange?.(true);
   }
 
   attach(): void {
@@ -46,6 +71,7 @@ export class Input {
     window.addEventListener("mousemove", this.onMouseMove);
     this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
     document.addEventListener("pointerlockchange", this.onPointerLockChange);
+    document.addEventListener("pointerlockerror", this.onLockError);
     this.canvas.addEventListener("contextmenu", this.onContextMenu);
   }
 
@@ -58,6 +84,7 @@ export class Input {
     window.removeEventListener("mousemove", this.onMouseMove);
     this.canvas.removeEventListener("wheel", this.onWheel);
     document.removeEventListener("pointerlockchange", this.onPointerLockChange);
+    document.removeEventListener("pointerlockerror", this.onLockError);
     this.canvas.removeEventListener("contextmenu", this.onContextMenu);
   }
 
@@ -151,7 +178,7 @@ export class Input {
   }
 
   requestLock(): void {
-    if (!this.pointerLocked) void this.canvas.requestPointerLock();
+    this.tryLock();
   }
 
   private onKeyDown(event: KeyboardEvent): void {
@@ -182,21 +209,15 @@ export class Input {
   private onMouseDown(event: MouseEvent): void {
     if (event.button === 2) {
       event.preventDefault();
-      if (!this.pointerLocked) {
-        void this.canvas.requestPointerLock();
-      } else {
-        this.jumpHitQueued = true;
-      }
+      if (!this.canAct) this.tryLock();
+      else this.jumpHitQueued = true;
       return;
     }
 
     if (event.button !== 0) return;
 
-    if (!this.pointerLocked) {
-      void this.canvas.requestPointerLock();
-    } else {
-      this.kickQueued = true;
-    }
+    if (!this.canAct) this.tryLock();
+    else this.kickQueued = true;
     this.dragging = true;
   }
 

@@ -1,7 +1,9 @@
 import { defineConfig } from "vite";
 
 // GitHub Pages serves the site at https://wolfxxx.github.io/ClaudeNinja/
-const pagesBase = process.env.GITHUB_PAGES === "1" ? "/ClaudeNinja/" : "/";
+// ARTIFACT=1 builds with relative URLs so the game can be hosted from any folder.
+const pagesBase =
+  process.env.ARTIFACT === "1" ? "./" : process.env.GITHUB_PAGES === "1" ? "/ClaudeNinja/" : "/";
 
 export default defineConfig({
   base: pagesBase,
@@ -10,7 +12,7 @@ export default defineConfig({
   build: {
     copyPublicDir: false,
     target: "es2022",
-    sourcemap: true,
+    sourcemap: process.env.ARTIFACT !== "1",
     chunkSizeWarningLimit: 4000,
   },
   server: {
