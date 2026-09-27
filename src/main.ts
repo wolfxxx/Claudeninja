@@ -1,4 +1,5 @@
 import "./style.css";
+import "./game/gltfJsonLoader";
 import { Game } from "./game/Game";
 
 const canvas = document.querySelector("#game-canvas");

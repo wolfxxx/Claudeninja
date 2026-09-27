@@ -12,7 +12,9 @@
     "three": "^0.185.1"
   },
   "devDependencies": {
+    "@gltf-transform/cli": "^4.5.0",
     "@types/three": "^0.185.0",
+    "draco3dgltf": "^1.5.7",
     "typescript": "~5.9.2",
     "vite": "^7.1.3"
   }
