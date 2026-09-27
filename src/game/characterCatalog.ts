@@ -14,7 +14,7 @@ export const HERO_NINJA = {
   height: 1.7,
 } as const;
 
-/** Red Clan enemies reuse the hero rig; this take is only used by them. */
+/** Jab take on the shared rig: the hero's combo opener and the Red Clan's punch. */
 export const ENEMY_PUNCH_URL = assetUrl("characters/NINJApunch.glb");
 
 export type NpcSpawn = {

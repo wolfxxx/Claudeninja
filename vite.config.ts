@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 
-// GitHub Pages serves the site at https://wolfxxx.github.io/GROKNinja/
-const pagesBase = process.env.GITHUB_PAGES === "1" ? "/GROKNinja/" : "/";
+// GitHub Pages serves the site at https://wolfxxx.github.io/ClaudeNinja/
+const pagesBase = process.env.GITHUB_PAGES === "1" ? "/ClaudeNinja/" : "/";
 
 export default defineConfig({
   base: pagesBase,

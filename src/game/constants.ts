@@ -63,8 +63,21 @@ export const PLAYER_REGEN = 5;
 export const PLAYER_REGEN_DELAY = 4;
 
 /** Player strikes: reach in metres from the player's feet, damage in enemy HP. */
+export const PUNCH_REACH = 2.0;
+export const PUNCH_DAMAGE = 1;
+/** Playback rate for the jab takes; the second jab is quicker. */
+export const PUNCH_TIME_SCALE = 1.6;
 export const KICK_REACH = 2.35;
 export const KICK_DAMAGE = 1;
+/** The roundhouse that closes a punch-punch-kick chain. */
+export const FINISHER_DAMAGE = 2;
+/** Seconds after a strike ends in which another click continues the chain. */
+export const COMBO_WINDOW = 0.5;
+/** Aim assist: strikes snap toward an enemy inside this radius and lunge to meet it. */
+export const STRIKE_ASSIST_RANGE = 4.2;
+/** Seconds a perfect dodge leaves your next strikes empowered. */
+export const COUNTER_WINDOW = 1.6;
+export const COUNTER_MULTIPLIER = 2;
 export const JUMP_HIT_REACH = 3.5;
 export const JUMP_HIT_DAMAGE = 2;
 export const ENEMY_HEIGHT = 1.78;

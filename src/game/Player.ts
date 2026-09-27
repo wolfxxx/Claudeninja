@@ -1,5 +1,9 @@
 import * as THREE from "three";
 import {
+  COMBO_WINDOW,
+  COUNTER_MULTIPLIER,
+  COUNTER_WINDOW,
+  FINISHER_DAMAGE,
   GRAVITY,
   JUMP_HIT_DAMAGE,
   JUMP_HIT_REACH,
@@ -19,6 +23,10 @@ import {
   PLAYER_STAND_Y,
   PLAYER_START,
   PLAYER_TURN_SPEED,
+  PUNCH_DAMAGE,
+  PUNCH_REACH,
+  PUNCH_TIME_SCALE,
+  STRIKE_ASSIST_RANGE,
   RUN_CLIP_SPEED,
   SPRINT_SPEED,
   WALK_CLIP_SPEED,
@@ -49,13 +57,22 @@ const CLIP_ALIASES: ReadonlyArray<[string, string[]]> = [
   ["punch", ["punch", "jab", "strike"]],
 ];
 
+export type StrikeKind = "punch" | "kick" | "jumphit";
+
 export type PlayerAttack = {
   /** New id per strike so each strike damages an enemy at most once. */
   id: number;
-  kind: "kick" | "jumphit";
+  kind: StrikeKind;
   reach: number;
   damage: number;
+  /** Last blow of the punch-punch-kick chain: launches and staggers. */
+  finisher: boolean;
+  /** Empowered by a perfect dodge. */
+  counter: boolean;
 };
+
+/** Left-click chain. Falls back to kicks only until the jab take has loaded. */
+const COMBO: ReadonlyArray<"punch" | "kick"> = ["punch", "punch", "kick"];
 
 /**
  * Player transform lives on `group` (origin at the feet).
@@ -68,7 +85,13 @@ export class Player {
   private grounded = true;
   private sprinting = false;
   private rolling = false;
-  private kicking = false;
+  /** Grounded strike in progress (the old `kicking` flag, generalised to the chain). */
+  private strike: "punch" | "kick" | null = null;
+  private comboStep = 0;
+  private comboQueued = false;
+  private comboWindow = 0;
+  private counterTimer = 0;
+  private strikeCounter = false;
   private jumpAttacking = false;
   private attackSerial = 0;
   private slamTimer = 0;
@@ -77,7 +100,13 @@ export class Player {
   private stepDistance = 0;
   private stepFoot = 0;
   onSound: SoundHook | null = null;
-  onAttackEffect: ((kind: "kick" | "slam", at: THREE.Vector3, facing: number) => void) | null = null;
+  onAttackEffect: ((kind: "kick" | "punch" | "slam", at: THREE.Vector3, facing: number) => void) | null = null;
+  /** Fired when a roll starts — the game checks it against incoming blows for a perfect dodge. */
+  onRollStart: (() => void) | null = null;
+  /** Fired on landing and on sprint pushes, for dust. */
+  onDust: ((at: THREE.Vector3, amount: number) => void) | null = null;
+  /** Aim assist: nearest living enemy position within `range`, supplied by the game. */
+  findTarget: ((from: THREE.Vector3, range: number) => THREE.Vector3 | null) | null = null;
   private hp = PLAYER_MAX_HP;
   private invulnTimer = 0;
   private stunTimer = 0;
@@ -129,7 +158,7 @@ export class Player {
     this.singleClip = false;
     this.lastAnim = "idle";
     this.rolling = false;
-    this.kicking = false;
+    this.strike = null;
     this.jumpAttacking = false;
     this.restPose.length = 0;
     this.clipRoot = null;
@@ -204,20 +233,40 @@ export class Player {
   }
 
   /** A strike that has started (wind-up included), so enemies can react before it lands. */
-  getAttackIntent(): { id: number; kind: "kick" | "jumphit" } | null {
-    if (this.kicking) return { id: this.attackSerial, kind: "kick" };
+  getAttackIntent(): { id: number; kind: StrikeKind } | null {
+    if (this.strike) return { id: this.attackSerial, kind: this.strike };
     if (this.jumpAttacking) return { id: this.attackSerial, kind: "jumphit" };
     return null;
   }
 
   /** The strike currently able to deal damage, if any. */
   getActiveAttack(): PlayerAttack | null {
-    if (this.kicking) {
-      const kick = this.actions.get("kick");
-      if (!kick) return null;
-      const t = kick.time / kick.getClip().duration;
+    if (this.strike) {
+      const action = this.actions.get(this.strike);
+      if (!action) return null;
+      const t = action.time / action.getClip().duration;
+      const mult = this.strikeCounter ? COUNTER_MULTIPLIER : 1;
+      if (this.strike === "punch") {
+        if (t < 0.24 || t > 0.56) return null;
+        return {
+          id: this.attackSerial,
+          kind: "punch",
+          reach: PUNCH_REACH,
+          damage: PUNCH_DAMAGE * mult,
+          finisher: false,
+          counter: this.strikeCounter,
+        };
+      }
       if (t < 0.3 || t > 0.7) return null;
-      return { id: this.attackSerial, kind: "kick", reach: KICK_REACH, damage: KICK_DAMAGE };
+      const finisher = this.isFinisher();
+      return {
+        id: this.attackSerial,
+        kind: "kick",
+        reach: KICK_REACH,
+        damage: (finisher ? FINISHER_DAMAGE : KICK_DAMAGE) * mult,
+        finisher,
+        counter: this.strikeCounter,
+      };
     }
     // Damage begins at impact, in sync with the visible ground shockwave.
     if (this.slamTimer > 0) {
@@ -225,7 +274,9 @@ export class Player {
         id: this.attackSerial,
         kind: "jumphit",
         reach: JUMP_HIT_REACH,
-        damage: JUMP_HIT_DAMAGE,
+        damage: JUMP_HIT_DAMAGE * (this.strikeCounter ? COUNTER_MULTIPLIER : 1),
+        finisher: true,
+        counter: this.strikeCounter,
       };
     }
     return null;
@@ -238,6 +289,25 @@ export class Player {
     const dz = z - this.group.position.z;
     if (dx * dx + dz * dz < 1e-4) return;
     this.group.rotation.y = Math.atan2(dx, dz);
+  }
+
+  /** A perfect dodge: the next strikes started inside the window hit twice as hard. */
+  grantCounter(): void {
+    this.counterTimer = COUNTER_WINDOW;
+    this.invulnTimer = Math.max(this.invulnTimer, 0.5);
+  }
+
+  hasCounter(): boolean {
+    return this.counterTimer > 0;
+  }
+
+  isSprinting(): boolean {
+    return this.sprinting;
+  }
+
+  /** 0-based position in the punch-punch-kick chain, for the HUD. */
+  getComboStep(): number {
+    return this.comboStep;
   }
 
   getHealth(): { hp: number; max: number } {
@@ -255,7 +325,9 @@ export class Player {
     this.invulnTimer = 0.6;
     this.stunTimer = 0.22;
     this.sinceHit = 0;
-    this.kicking = false;
+    this.strike = null;
+    this.comboQueued = false;
+    this.comboWindow = 0;
 
     const dx = this.group.position.x - fromX;
     const dz = this.group.position.z - fromZ;
@@ -278,7 +350,9 @@ export class Player {
     this.stunTimer = 0;
     this.sinceHit = Infinity;
     this.rolling = false;
-    this.kicking = false;
+    this.strike = null;
+    this.comboQueued = false;
+    this.counterTimer = 0;
     this.jumpAttacking = false;
     this.onHealthChange?.(this.hp, PLAYER_MAX_HP, false);
   }
@@ -327,6 +401,8 @@ export class Player {
 
   private updateCombatTimers(delta: number): void {
     this.slamTimer = Math.max(0, this.slamTimer - delta);
+    this.counterTimer = Math.max(0, this.counterTimer - delta);
+    if (!this.strike) this.comboWindow = Math.max(0, this.comboWindow - delta);
     this.invulnTimer = Math.max(0, this.invulnTimer - delta);
     this.stunTimer = Math.max(0, this.stunTimer - delta);
     this.sinceHit += delta;
@@ -381,11 +457,13 @@ export class Player {
 
     if (
       !this.rolling &&
-      !this.kicking &&
       this.grounded &&
       this.actions.has("roll") &&
       wantsRoll
     ) {
+      // Rolling cancels a strike: dodging must always win over attacking.
+      this.strike = null;
+      this.comboQueued = false;
       this.rolling = true;
       if (hasInput) this.rollDir.copy(this.moveIntent);
       else {
@@ -399,6 +477,8 @@ export class Player {
       this.rollSpeed =
         (ROLL_DISTANCE / Math.max(dur / ROLL_TIME_SCALE, 0.25)) * (1 - this.wade * WADE_SLOW);
       this.onSound?.(this.wade > 0.15 ? "splash" : "roll", this.group.position);
+      if (this.wade < 0.15) this.onDust?.(this.group.position, 0.8);
+      this.onRollStart?.();
     }
 
     if (this.rolling) {
@@ -408,24 +488,21 @@ export class Player {
       return;
     }
 
-    if (
-      !this.kicking &&
-      !this.jumpAttacking &&
-      this.grounded &&
-      this.actions.has("kick") &&
-      wantsKick
-    ) {
-      this.kicking = true;
-      this.kickWhooshed = false;
-      this.kickEffectPlayed = false;
-      this.attackSerial++;
+    if (wantsKick && !this.jumpAttacking && this.grounded && this.actions.has("kick")) {
+      if (!this.strike) this.startStrike();
+      else this.comboQueued = true;
     }
 
-    const speed = (input.isSprinting() ? SPRINT_SPEED : WALK_SPEED) * (1 - this.wade * WADE_SLOW);
-    this.sprinting = hasInput && input.isSprinting();
+    // Strikes plant the feet: only a trickle of steering, the lunge does the travelling.
+    const strikeSlow = this.strike ? 0.2 : 1;
+    const speed =
+      (input.isSprinting() ? SPRINT_SPEED : WALK_SPEED) * (1 - this.wade * WADE_SLOW) * strikeSlow;
+    const wasSprinting = this.sprinting;
+    this.sprinting = hasInput && input.isSprinting() && !this.strike;
+    if (this.sprinting && !wasSprinting && this.wade < 0.15) this.onDust?.(this.group.position, 0.5);
     this.desiredVelocity.copy(this.moveIntent).multiplyScalar(hasInput ? speed : 0);
 
-    const responsiveness = hasInput ? MOVE_ACCEL : MOVE_DECEL;
+    const responsiveness = this.strike ? 7 : hasInput ? MOVE_ACCEL : MOVE_DECEL;
     const t = 1 - Math.exp(-responsiveness * delta);
     this.velocity.x = THREE.MathUtils.lerp(this.velocity.x, this.desiredVelocity.x, t);
     this.velocity.z = THREE.MathUtils.lerp(this.velocity.z, this.desiredVelocity.z, t);
@@ -442,11 +519,14 @@ export class Player {
       wantsJumpHit &&
       !this.jumpAttacking &&
       !this.rolling &&
-      !this.kicking &&
       this.actions.has("jumphit")
     ) {
+      // A jump attack may cancel a grounded strike, so chains can end in a slam.
+      this.strike = null;
+      this.comboQueued = false;
       this.jumpAttacking = true;
       this.attackSerial++;
+      this.strikeCounter = this.counterTimer > 0;
       if (this.grounded) {
         this.velocity.y = JUMP_SPEED;
         this.grounded = false;
@@ -455,7 +535,7 @@ export class Player {
     } else if (
       this.grounded &&
       !this.rolling &&
-      !this.kicking &&
+      !this.strike &&
       !this.jumpAttacking &&
       input.consumeJump()
     ) {
@@ -479,6 +559,7 @@ export class Player {
           this.water?.ripple(x, z, 1.1);
         } else {
           this.onSound?.(this.jumpAttacking ? "slam_impact" : "land", this.group.position);
+          this.onDust?.(this.group.position, this.jumpAttacking ? 1.6 : 0.6);
         }
         if (this.jumpAttacking) this.onAttackEffect?.("slam", this.group.position, this.group.rotation.y);
       }
@@ -699,7 +780,7 @@ export class Player {
     let target = "idle";
     if (this.rolling && this.actions.has("roll")) target = "roll";
     else if (this.jumpAttacking && this.actions.has("jumphit")) target = "jumphit";
-    else if (this.kicking && this.actions.has("kick")) target = "kick";
+    else if (this.strike && this.actions.has(this.strike)) target = this.strike;
     else if (!this.grounded) target = this.actions.has("jump") ? "jump" : "idle";
     else if (speed > 0.45) {
       if (this.sprinting && this.actions.has("run")) target = "run";
@@ -747,16 +828,6 @@ export class Player {
       }
     }
 
-    const kick = this.actions.get("kick");
-    if (target === "kick" && this.lastAnim !== "kick" && kick) {
-      kick.reset();
-      kick.timeScale = KICK_TIME_SCALE;
-      kick.play();
-      kick.setEffectiveWeight(1);
-      for (const [name, action] of this.actions) {
-        if (name !== "kick") action.setEffectiveWeight(0);
-      }
-    }
 
     const fadeRate =
       target === "jump" ||
@@ -765,6 +836,8 @@ export class Player {
       this.lastAnim === "roll" ||
       target === "kick" ||
       this.lastAnim === "kick" ||
+      target === "punch" ||
+      this.lastAnim === "punch" ||
       target === "jumphit" ||
       this.lastAnim === "jumphit"
         ? 18
@@ -792,24 +865,93 @@ export class Player {
       const dur = roll.getClip().duration;
       if (!roll.isRunning() || roll.time >= dur * 0.92) this.rolling = false;
     }
-    if (this.kicking && kick) {
-      const dur = kick.getClip().duration;
-      if (!this.kickWhooshed && kick.time >= dur * 0.18) {
-        this.kickWhooshed = true;
-        this.onSound?.("kick_whoosh", this.group.position);
-      }
-      if (!this.kickEffectPlayed && kick.time >= dur * 0.27) {
-        this.kickEffectPlayed = true;
-        this.onAttackEffect?.("kick", this.group.position, this.group.rotation.y);
-      }
-      if (this.model) {
-        const t = THREE.MathUtils.smoothstep(kick.time / dur, 0.12, 0.82);
-        this.model.rotation.y = this.modelBaseRotationY + t * Math.PI * 2;
-      }
-      if (!kick.isRunning() || kick.time >= dur * 0.9) this.kicking = false;
-    }
-    if (!this.kicking && this.model) this.model.rotation.y = this.modelBaseRotationY;
+    this.updateStrike();
+    if (this.strike !== "kick" && this.model) this.model.rotation.y = this.modelBaseRotationY;
     if (target === "idle" && !this.actions.has("idle")) this.applyStandingRest();
+  }
+
+  private isFinisher(): boolean {
+    return this.strike === "kick" && this.comboStep === COMBO.length - 1 && this.actions.has("punch");
+  }
+
+  /** Begin the next blow of the chain, snapping toward and lunging at the nearest enemy. */
+  private startStrike(): void {
+    const hasPunch = this.actions.has("punch");
+    this.comboStep = this.comboWindow > 0 || this.comboQueued ? (this.comboStep + 1) % COMBO.length : 0;
+    this.comboQueued = false;
+    this.comboWindow = 0;
+    const kind = hasPunch ? COMBO[this.comboStep] : "kick";
+    const action = this.actions.get(kind);
+    if (!action) return;
+
+    this.strike = kind;
+    this.strikeCounter = this.counterTimer > 0;
+    this.kickWhooshed = false;
+    this.kickEffectPlayed = false;
+    this.attackSerial++;
+
+    const pos = this.group.position;
+    // A primed counter turns the strike into a shadow dash that closes much longer gaps.
+    const dash = this.strikeCounter;
+    const target = this.findTarget?.(pos, dash ? STRIKE_ASSIST_RANGE * 1.9 : STRIKE_ASSIST_RANGE) ?? null;
+    let lunge = kind === "kick" ? 2.2 : 3;
+    if (target) {
+      const dx = target.x - pos.x;
+      const dz = target.z - pos.z;
+      const d = Math.hypot(dx, dz);
+      this.group.rotation.y = Math.atan2(dx, dz);
+      // Close the gap to striking distance, but never overshoot into the enemy.
+      lunge = THREE.MathUtils.clamp((d - 1.15) * 7, 0, dash ? 50 : 14);
+    }
+    const yaw = this.group.rotation.y;
+    this.velocity.x = Math.sin(yaw) * lunge;
+    this.velocity.z = Math.cos(yaw) * lunge;
+
+    action.reset();
+    action.timeScale =
+      kind === "kick" ? KICK_TIME_SCALE * (this.isFinisher() ? 1.08 : 1) : PUNCH_TIME_SCALE * (this.comboStep === 1 ? 1.15 : 1);
+    action.play();
+    for (const [name, other] of this.actions) other.setEffectiveWeight(name === kind ? 1 : 0);
+    this.lastAnim = kind;
+  }
+
+  private updateStrike(): void {
+    if (!this.strike) return;
+    const action = this.actions.get(this.strike);
+    if (!action) {
+      this.strike = null;
+      return;
+    }
+    const dur = action.getClip().duration;
+    const t = action.time / dur;
+    const isKick = this.strike === "kick";
+
+    if (!this.kickWhooshed && t >= (isKick ? 0.18 : 0.16)) {
+      this.kickWhooshed = true;
+      this.onSound?.(isKick ? "kick_whoosh" : "enemy_whoosh", this.group.position, isKick ? 1 : 0.8);
+    }
+    if (!this.kickEffectPlayed && t >= (isKick ? 0.27 : 0.24)) {
+      this.kickEffectPlayed = true;
+      this.onAttackEffect?.(this.strike, this.group.position, this.group.rotation.y);
+    }
+    if (isKick && this.model) {
+      const spin = THREE.MathUtils.smoothstep(t, 0.12, 0.82);
+      this.model.rotation.y = this.modelBaseRotationY + spin * Math.PI * 2;
+    }
+
+    // Jabs can be chained early; the roundhouse must finish.
+    const cancelAt = isKick ? 0.88 : 0.6;
+    if (this.comboQueued && t >= (isKick ? 0.8 : 0.46)) {
+      this.strike = null;
+      if (this.model) this.model.rotation.y = this.modelBaseRotationY;
+      this.startStrike();
+      return;
+    }
+    if (!action.isRunning() || t >= cancelAt) {
+      this.strike = null;
+      // After the finisher the chain restarts from the first jab.
+      this.comboWindow = this.comboStep === COMBO.length - 1 ? 0 : COMBO_WINDOW;
+    }
   }
 
   private createPlaceholderMesh(): THREE.Group {

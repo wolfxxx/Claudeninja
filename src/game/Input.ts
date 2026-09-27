@@ -18,6 +18,7 @@ export class Input {
   private helpersQueued = false;
   private muteQueued = false;
   private pauseQueued = false;
+  private fxQueued = false;
 
   onLockChange: ((locked: boolean) => void) | null = null;
 
@@ -126,6 +127,12 @@ export class Input {
     return toggled;
   }
 
+  consumeFxToggle(): boolean {
+    const toggled = this.fxQueued;
+    this.fxQueued = false;
+    return toggled;
+  }
+
   consumePauseToggle(): boolean {
     const toggled = this.pauseQueued;
     this.pauseQueued = false;
@@ -150,6 +157,7 @@ export class Input {
   private onKeyDown(event: KeyboardEvent): void {
     if (event.code === "KeyM" && !event.repeat) this.muteQueued = true;
     if (event.code === "KeyP" && !event.repeat) this.pauseQueued = true;
+    if (event.code === "KeyG" && !event.repeat) this.fxQueued = true;
     if (event.code === "ShiftLeft") {
       event.preventDefault();
       if (!event.repeat) this.jumpQueued = true;

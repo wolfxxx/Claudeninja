@@ -8,3 +8,6 @@ if (!(canvas instanceof HTMLCanvasElement)) {
 
 const game = new Game(canvas);
 game.init();
+
+// Dev-only handle for poking at the running game from the console / test scripts.
+if (import.meta.env.DEV) (window as unknown as { __game: Game }).__game = game;

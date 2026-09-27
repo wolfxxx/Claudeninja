@@ -25,7 +25,7 @@ import {
 } from "./constants";
 import type { SoundHook } from "./Audio";
 import type { WaterQuery } from "./Nature";
-import { flattenRootMotion, type Player } from "./Player";
+import { flattenRootMotion, type Player, type PlayerAttack, type StrikeKind } from "./Player";
 
 type EnemyClip = "idle" | "run" | "punch" | "kick" | "roll" | "jump" | "jumphit";
 type EnemyState =
@@ -100,6 +100,49 @@ function rollTraits(wave: number): Traits {
 
 const rand = (min: number, max: number) => min + Math.random() * (max - min);
 
+/** Height of the telegraph glint and health bar above an enemy's feet. */
+const HEAD_Y = ENEMY_HEIGHT + 0.12;
+const BAR_Y = ENEMY_HEIGHT + 0.42;
+
+let glintTex: THREE.Texture | null = null;
+/** Four-point star used to telegraph an incoming strike. Built once and shared. */
+function glintTexture(): THREE.Texture {
+  if (glintTex) return glintTex;
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    const c = size / 2;
+    const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+    g.addColorStop(0, "rgba(255,255,255,1)");
+    g.addColorStop(0.18, "rgba(255,220,180,0.85)");
+    g.addColorStop(0.5, "rgba(255,120,60,0.18)");
+    g.addColorStop(1, "rgba(255,80,40,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    ctx.globalCompositeOperation = "lighter";
+    for (const [w, h] of [[size, 5], [5, size]]) {
+      const lg = ctx.createRadialGradient(c, c, 0, c, c, c);
+      lg.addColorStop(0, "rgba(255,255,255,0.95)");
+      lg.addColorStop(1, "rgba(255,160,90,0)");
+      ctx.fillStyle = lg;
+      ctx.fillRect(c - w / 2, c - h / 2, w, h);
+    }
+  }
+  glintTex = new THREE.CanvasTexture(canvas);
+  glintTex.colorSpace = THREE.SRGBColorSpace;
+  return glintTex;
+}
+
+export type EnemyHit = {
+  at: THREE.Vector3;
+  attack: PlayerAttack;
+  killed: boolean;
+  /** True when this kill emptied the wave. */
+  lastOfWave: boolean;
+};
+
 /**
  * Red Clan ninjas: clones of the hero's Mixamo rig with a crimson outfit.
  * Sharing the skeleton means every Mixamo take the hero loads also drives them.
@@ -118,6 +161,8 @@ export class EnemyManager {
   private started = false;
 
   onKill: ((kills: number) => void) | null = null;
+  /** Every connecting player blow, for hit-stop, sparks, numbers and the combo meter. */
+  onHit: ((hit: EnemyHit) => void) | null = null;
   onWave: ((wave: number) => void) | null = null;
   onSound: SoundHook | null = null;
   private readonly emit: SoundHook = (name, at, volume) => this.onSound?.(name, at, volume);
@@ -145,6 +190,21 @@ export class EnemyManager {
 
   setCollisionMeshes(meshes: readonly THREE.Mesh[]): void {
     this.collisionMeshes = [...meshes];
+  }
+
+  /** Aim assist for the player's strikes. */
+  nearestAlivePosition(pos: THREE.Vector3, maxDist: number): THREE.Vector3 | null {
+    return this.nearestAlive(pos, maxDist)?.group.position ?? null;
+  }
+
+  /** Is a blow about to land on the player right now? Used to detect a perfect dodge. */
+  isThreatening(player: Player): boolean {
+    const p = player.group.position;
+    return this.enemies.some((enemy) => enemy.threatens(p));
+  }
+
+  getWave(): number {
+    return this.wave;
   }
 
   getKills(): number {
@@ -236,7 +296,7 @@ export class EnemyManager {
     if (!intent || intent.id === this.lastIntentId) return;
     this.lastIntentId = intent.id;
     const p = player.group.position;
-    const range = intent.kind === "kick" ? 3.4 : 5;
+    const range = intent.kind === "jumphit" ? 5 : intent.kind === "kick" ? 3.4 : 3;
     for (const enemy of this.enemies) {
       if (enemy.isDead() || enemy.distanceTo(p) > range) continue;
       enemy.considerDodge(intent.kind, p);
@@ -250,9 +310,14 @@ export class EnemyManager {
 
     if (attack.id !== this.lastAttackId) {
       this.lastAttackId = attack.id;
-      const target = this.nearestAlive(p, 3.2);
-      if (target) player.faceTowards(target.group.position.x, target.group.position.z);
+      // Strikes aim themselves when they start; the slam still needs a late snap.
+      if (attack.kind === "jumphit") {
+        const target = this.nearestAlive(p, 3.2);
+        if (target) player.faceTowards(target.group.position.x, target.group.position.z);
+      }
     }
+    const fx = Math.sin(player.group.rotation.y);
+    const fz = Math.cos(player.group.rotation.y);
 
     for (const enemy of this.enemies) {
       if (enemy.isDead() || enemy.lastHitBy === attack.id) continue;
@@ -260,16 +325,27 @@ export class EnemyManager {
       const dz = enemy.group.position.z - p.z;
       const dist = Math.hypot(dx, dz);
       if (dist > attack.reach) continue;
-      // A spinning roundhouse and a ground shockwave both sweep the full circle.
+      // A spinning roundhouse and a ground shockwave both sweep the full circle;
+      // a jab only reaches what is in front of the fist.
       if (Math.abs(p.y - enemy.group.position.y) > 1.6) continue;
+      if (attack.kind === "punch" && dist > 0.6 && (dx * fx + dz * fz) / dist < 0.25) continue;
 
-      const result = enemy.hurt(attack.damage, p.x, p.z);
+      const result = enemy.hurt(attack.damage, p.x, p.z, attack.finisher);
       if (result === "dodged") continue;
       enemy.lastHitBy = attack.id;
-      if (result === "killed") {
+      const killed = result === "killed";
+      if (killed) {
         this.kills++;
         this.onKill?.(this.kills);
       }
+      const at = enemy.group.position.clone();
+      at.y += ENEMY_HEIGHT * 0.62;
+      this.onHit?.({
+        at,
+        attack,
+        killed,
+        lastOfWave: killed && this.enemies.every((e) => e.isDead()),
+      });
     }
   }
 
@@ -332,6 +408,12 @@ class Enemy {
   private readonly mixer: THREE.AnimationMixer;
   private readonly actions = new Map<EnemyClip, THREE.AnimationAction>();
   private readonly ornaments: THREE.Mesh[] = [];
+  private readonly glint: THREE.Sprite;
+  private readonly bar: THREE.Sprite;
+  private readonly barCanvas = document.createElement("canvas");
+  private readonly barTexture: THREE.CanvasTexture;
+  private barShown = 0;
+  private barDamage = 1;
   private readonly materials: THREE.MeshStandardMaterial[] = [];
   private readonly velocity = new THREE.Vector3();
   private readonly moveDir = new THREE.Vector3();
@@ -371,6 +453,7 @@ class Enemy {
   private evadeDuration = 0;
   private recoverDuration = 0.6;
   private hitStreak = 0;
+  private heavyHit = false;
   private lastHitAt = -10;
   private breakAway = false;
   private clock = 0;
@@ -402,6 +485,40 @@ class Enemy {
       obj.material = Array.isArray(obj.material) ? tinted : tinted[0];
     });
     this.addRoleLook();
+
+    this.glint = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: glintTexture(),
+        color: new THREE.Color(3, 1.3, 0.7),
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0,
+      }),
+    );
+    this.glint.position.set(0, HEAD_Y, 0);
+    this.glint.renderOrder = 11;
+    this.glint.visible = false;
+    this.group.add(this.glint);
+
+    this.barCanvas.width = 96;
+    this.barCanvas.height = 12;
+    this.barTexture = new THREE.CanvasTexture(this.barCanvas);
+    this.barTexture.colorSpace = THREE.SRGBColorSpace;
+    this.bar = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.barTexture,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0,
+      }),
+    );
+    this.bar.scale.set(0.95, 0.12, 1);
+    this.bar.position.set(0, BAR_Y, 0);
+    this.bar.renderOrder = 10;
+    this.group.add(this.bar);
+    this.drawBar();
 
     this.mixer = new THREE.AnimationMixer(body);
     this.bindClips(clips);
@@ -442,6 +559,16 @@ class Enemy {
     return this.state === "dead" && this.stateTime > 4.2;
   }
 
+  /** Mid wind-up or dropping out of a leap close by: a roll now is a perfect dodge. */
+  threatens(p: THREE.Vector3): boolean {
+    const dist = this.distanceTo(p);
+    if (this.state === "attack") {
+      return this.attackProgress > 0.1 && this.attackProgress < 0.58 && dist < ENEMY_REACH + 1.1;
+    }
+    if (this.state === "leap") return this.stateTime > 0.2 && dist < 4.2;
+    return false;
+  }
+
   calmDown(): void {
     if (this.state === "dead") return;
     this.setState("idle");
@@ -451,17 +578,17 @@ class Enemy {
   }
 
   /** The player started a strike nearby; maybe react after a human-ish delay. */
-  considerDodge(kind: "kick" | "jumphit", from: THREE.Vector3): void {
+  considerDodge(kind: StrikeKind, from: THREE.Vector3): void {
     if (this.pendingDodge >= 0 || this.dodgeCooldown > 0) return;
     if (!this.canEvadeNow()) return;
     if (!this.actions.has("roll") && !this.actions.has("jump")) return;
     if (Math.random() > this.traits.dodge) return;
     // Kicks land fast, so reactions must be quick; the jump attack gives more warning.
-    this.pendingDodge = kind === "kick" ? rand(0.04, 0.14) : rand(0.15, 0.35);
+    this.pendingDodge = kind === "jumphit" ? rand(0.15, 0.35) : kind === "kick" ? rand(0.04, 0.14) : rand(0.03, 0.1);
     this.lastThreat.copy(from);
   }
 
-  hurt(damage: number, fromX: number, fromZ: number): "hit" | "killed" | "dodged" {
+  hurt(damage: number, fromX: number, fromZ: number, heavy = false): "hit" | "killed" | "dodged" {
     if (this.state === "dead") return "dodged";
     if (this.state === "evade" && this.evadeKind !== "rollIn") return "dodged";
 
@@ -475,9 +602,16 @@ class Enemy {
     const dx = this.group.position.x - fromX;
     const dz = this.group.position.z - fromZ;
     const len = Math.hypot(dx, dz) || 1;
-    const knock = damage > 1 ? 8.5 : 6;
+    const knock = heavy ? 11.5 : damage > 1 ? 8.5 : 5;
     this.velocity.x = (dx / len) * knock;
     this.velocity.z = (dz / len) * knock;
+    // Finishers pop the target off its feet.
+    if (heavy || this.hp <= 0) this.velocity.y = heavy ? 4.8 : 3.2;
+    this.heavyHit = heavy;
+    this.barShown = 1;
+    this.barDamage = 1;
+    this.drawBar();
+    this.glint.visible = false;
     this.group.rotation.y = Math.atan2(-dx, -dz);
     this.sound("hit_kick", this.group.position, damage > 1 ? 1 : 0.85);
 
@@ -487,7 +621,7 @@ class Enemy {
       return "killed";
     }
     this.sound("enemy_hurt", this.group.position);
-    this.lean = damage > 1 ? 0.55 : 0.35;
+    this.lean = heavy ? 0.85 : damage > 1 ? 0.55 : 0.35;
     // Getting juggled? Sometimes they break out with a quick evade instead of taking a third hit.
     this.breakAway = this.hitStreak >= 2 && Math.random() < 0.35 + this.traits.dodge * 0.5;
     this.setState("hurt");
@@ -621,7 +755,7 @@ class Enemy {
         if (this.breakAway && this.stateTime > 0.18) {
           this.breakAway = false;
           this.startEvade(p, true);
-        } else if (this.stateTime > 0.45) {
+        } else if (this.stateTime > (this.heavyHit ? 0.85 : 0.45) && pos.y <= 0) {
           this.cooldown = Math.max(this.cooldown, 0.35);
           this.setState("chase");
         }
@@ -640,10 +774,14 @@ class Enemy {
       const speed = Math.hypot(this.velocity.x, this.velocity.z);
       run.timeScale = THREE.MathUtils.clamp(speed / RUN_CLIP_SPEED, 0.55, 1.4);
     }
+    this.updateOverhead(delta);
     this.blendTo(anim, delta);
   }
 
   dispose(scene: THREE.Scene): void {
+    this.bar.material.dispose();
+    this.barTexture.dispose();
+    this.glint.material.dispose();
     scene.remove(this.group);
     this.mixer.stopAllAction();
     // Geometry and textures are shared with the hero; only the tinted materials are ours.
@@ -931,6 +1069,8 @@ class Enemy {
   }
 
   private updateDeath(delta: number): void {
+    this.glint.visible = false;
+    this.bar.material.opacity = Math.max(0, this.bar.material.opacity - delta * 3);
     const decay = 1 - Math.exp(-5 * delta);
     this.velocity.x = THREE.MathUtils.lerp(this.velocity.x, 0, decay);
     this.velocity.z = THREE.MathUtils.lerp(this.velocity.z, 0, decay);
@@ -987,6 +1127,49 @@ class Enemy {
     while (diff > Math.PI) diff -= Math.PI * 2;
     while (diff < -Math.PI) diff += Math.PI * 2;
     this.group.rotation.y += diff * (1 - Math.exp(-rate * delta));
+  }
+
+  /** Wind-up glint (the cue to roll) and the health bar. */
+  private updateOverhead(delta: number): void {
+    const windUp =
+      (this.state === "attack" && this.attackProgress < 0.4) ||
+      (this.state === "leap" && this.stateTime < 0.35);
+    this.glint.visible = windUp;
+    if (windUp) {
+      const k = this.state === "attack" ? this.attackProgress / 0.4 : this.stateTime / 0.35;
+      const pulse = Math.sin(Math.min(k, 1) * Math.PI);
+      this.glint.material.opacity = pulse;
+      this.glint.material.rotation = k * 1.6;
+      this.glint.scale.setScalar(0.35 + pulse * 0.45);
+    }
+
+    // The bar lingers while fighting, then fades once they've been left alone.
+    const engaged = this.isEngaged() && this.hp < ENEMY_HP;
+    this.barShown = engaged ? 1 : Math.max(0, this.barShown - delta * 0.6);
+    this.bar.material.opacity = Math.min(1, this.barShown * 1.5) * 0.92;
+    if (this.barDamage > 0) {
+      this.barDamage = Math.max(0, this.barDamage - delta * 2.5);
+      this.drawBar();
+    }
+  }
+
+  private drawBar(): void {
+    const ctx = this.barCanvas.getContext("2d");
+    if (!ctx) return;
+    const w = this.barCanvas.width;
+    const h = this.barCanvas.height;
+    const frac = THREE.MathUtils.clamp(this.hp / ENEMY_HP, 0, 1);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "rgba(10,8,8,0.8)";
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = `rgba(255,${Math.round(200 + 55 * this.barDamage)},${Math.round(180 * this.barDamage)},1)`;
+    ctx.fillRect(2, 2, (w - 4) * frac, h - 4);
+    const color = this.traits.archetype === "brawler" ? "#e0533f" : this.traits.archetype === "acrobat" ? "#b07ae0" : "#e0bc5c";
+    ctx.globalAlpha = 1 - this.barDamage * 0.7;
+    ctx.fillStyle = color;
+    ctx.fillRect(2, 2, (w - 4) * frac, h - 4);
+    ctx.globalAlpha = 1;
+    this.barTexture.needsUpdate = true;
   }
 
   /** Cheaper version of the player's triangle probe: one height, eight spokes. */

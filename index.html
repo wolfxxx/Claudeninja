@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="GROKNinja — third-person ninja brawler in the browser" />
+    <meta name="description" content="ClaudeNinja — third-person ninja brawler in the browser" />
     <link rel="icon" type="image/png" href="%BASE_URL%favicon.png" />
     <link rel="apple-touch-icon" href="%BASE_URL%favicon.png" />
-    <title>GROKNinja</title>
+    <title>ClaudeNinja</title>
   </head>
   <body>
     <div id="app">
@@ -18,7 +18,16 @@
         <div id="status">
           <div id="health"><div id="health-fill"></div></div>
           <div id="kills">Red Clan defeated: 0</div>
+          <div id="wave"></div>
         </div>
+        <div id="combo">
+          <div id="combo-count">0</div>
+          <div id="combo-label">hits</div>
+          <div id="combo-rank"></div>
+          <div id="combo-timer"></div>
+        </div>
+        <div id="callout"></div>
+        <div id="counter-ready">Counter ready</div>
         <div id="banner"></div>
         <div id="load-status">Loading character…</div>
         <div id="pause-overlay">
@@ -26,8 +35,8 @@
           <p>Press P or click to resume</p>
         </div>
         <p id="hint">
-          Click to play · WASD move · Space sprint · LShift jump · Ctrl roll ·
-          Click kick · RMB jump attack · Mouse look · Scroll zoom · P pause · M mute · H helpers
+          Click to play · WASD move · Space sprint · LShift jump · Ctrl roll (time it for a Shadow Step) ·
+          Click combo · RMB jump attack · Scroll zoom · P pause · M mute · G effects
         </p>
       </div>
     </div>

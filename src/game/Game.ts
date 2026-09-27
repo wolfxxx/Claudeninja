@@ -2,13 +2,16 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { ENEMY_PUNCH_URL, HERO_NINJA } from "./characterCatalog";
+import { Atmosphere } from "./Atmosphere";
 import { GameAudio } from "./Audio";
 import { CombatEffects } from "./CombatEffects";
-import { EnemyManager } from "./Enemies";
+import { EnemyManager, type EnemyHit } from "./Enemies";
 import { fitCharacter } from "./fitCharacter";
 import { Input } from "./Input";
 import { Nature } from "./Nature";
 import { Player } from "./Player";
+import { PostFX } from "./PostFX";
+import { SKY, SkyDome } from "./Sky";
 import { ThirdPersonCamera } from "./ThirdPersonCamera";
 import { Village } from "./Village";
 
@@ -16,11 +19,21 @@ const MAX_DELTA = 0.05;
 
 const LOAD_HERO_GLB = true;
 
+/** Seconds without landing a blow before the combo meter drops. */
+const COMBO_TIMEOUT = 2.6;
+const COMBO_RANKS: ReadonlyArray<[number, string]> = [
+  [20, "影 Shadow Legend"],
+  [14, "Sublime"],
+  [9, "Fierce"],
+  [5, "Sharp"],
+  [2, "Good"],
+];
+
 export class Game {
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.PerspectiveCamera;
   private readonly renderer: THREE.WebGLRenderer;
-  private readonly clock = new THREE.Clock();
+  private readonly timer = new THREE.Timer();
 
   private readonly player = new Player();
   private readonly followCam: ThirdPersonCamera;
@@ -30,6 +43,22 @@ export class Game {
   private readonly enemies = new EnemyManager(this.scene);
   private readonly audio = new GameAudio();
   private readonly combatEffects = new CombatEffects(this.scene);
+  private readonly sky = new SkyDome();
+  private readonly atmosphere = new Atmosphere(this.scene);
+  private postFX: PostFX | null = null;
+
+  /** Real seconds of near-frozen time after a blow lands. */
+  private hitStop = 0;
+  /** Real seconds of slow motion, and how slow. */
+  private slowMo = 0;
+  private slowScale = 1;
+  /** Slow-mo from a perfect dodge gets the blue ink look; wave-clear slow-mo does not. */
+  private dodgeFocus = false;
+  private combo = 0;
+  private bestCombo = 0;
+  private comboTimer = 0;
+  private calloutTimeout = 0;
+  private auraTimer = 0;
   private defeatTimer = 0;
   private bannerTimeout = 0;
   private readonly hud = {
@@ -39,6 +68,12 @@ export class Game {
     banner: document.getElementById("banner"),
     load: document.getElementById("load-status"),
     pause: document.getElementById("pause-overlay"),
+    combo: document.getElementById("combo"),
+    comboCount: document.getElementById("combo-count"),
+    comboRank: document.getElementById("combo-rank"),
+    callout: document.getElementById("callout"),
+    counter: document.getElementById("counter-ready"),
+    wave: document.getElementById("wave"),
   };
   private paused = false;
   /** Only auto-pause on Esc once the player has actually started playing. */
@@ -78,6 +113,12 @@ export class Game {
         void this.hud.hurt.offsetWidth;
         this.hud.hurt.classList.add("is-active");
       }
+      if (damaged) {
+        this.followCam.addTrauma(0.55);
+        this.postFX?.flashHurt();
+        this.hitStop = Math.max(this.hitStop, 0.05);
+        this.breakCombo();
+      }
     };
     this.input.onLockChange = (locked) => {
       if (locked) {
@@ -90,8 +131,16 @@ export class Game {
     this.player.onSound = this.audio.play;
     this.player.onAttackEffect = (kind, at, facing) => {
       if (kind === "kick") this.combatEffects.roundhouse(at, facing);
-      else this.combatEffects.slam(at);
+      else if (kind === "punch") this.combatEffects.jab(at, facing);
+      else {
+        this.combatEffects.slam(at);
+        this.followCam.addTrauma(0.35);
+      }
     };
+    this.player.onDust = (at, amount) => this.combatEffects.dust(at, amount);
+    this.player.findTarget = (from, range) => this.enemies.nearestAlivePosition(from, range);
+    this.player.onRollStart = () => this.checkPerfectDodge();
+    this.enemies.onHit = (hit) => this.onEnemyHit(hit);
     this.enemies.onSound = this.audio.play;
     this.enemies.onKill = (kills) => {
       if (this.hud.kills) this.hud.kills.textContent = `Red Clan defeated: ${kills}`;
@@ -100,6 +149,7 @@ export class Game {
       const banner = this.hud.banner;
       if (!banner || this.player.isDefeated()) return;
       banner.textContent = `Wave ${wave} — the Red Clan approaches`;
+      if (this.hud.wave) this.hud.wave.textContent = `Wave ${wave}`;
       banner.classList.add("is-visible");
       window.clearTimeout(this.bannerTimeout);
       this.bannerTimeout = window.setTimeout(() => banner.classList.remove("is-visible"), 2600);
@@ -112,6 +162,7 @@ export class Game {
     this.setupLights();
     this.setupGround();
     this.setupHelpers();
+    this.postFX = new PostFX(this.renderer, this.scene, this.camera);
     this.loadVillage();
 
     this.scene.add(this.player.group);
@@ -125,7 +176,7 @@ export class Game {
     window.addEventListener("resize", this.onResize);
     this.onResize();
 
-    this.clock.start();
+    this.timer.connect(document);
     this.rafId = requestAnimationFrame(this.loop);
   }
 
@@ -133,36 +184,42 @@ export class Game {
     cancelAnimationFrame(this.rafId);
     window.removeEventListener("resize", this.onResize);
     this.input.dispose();
+    this.postFX?.dispose();
     this.renderer.dispose();
     this.combatEffects.dispose();
+    this.atmosphere.dispose();
+    this.sky.dispose();
   }
 
   private setupRenderer(): void {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.45;
+    this.renderer.toneMappingExposure = 1.05;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
   }
 
   private setupScene(): void {
-    const fogColor = 0xa8c0c8;
-    this.scene.background = new THREE.Color(fogColor);
-    this.scene.fog = new THREE.Fog(fogColor, 55, 130);
+    // The dome paints the sky; fog matches its horizon so distance melts into haze.
+    this.scene.background = SKY.fog.clone();
+    this.scene.fog = new THREE.Fog(SKY.fog, 38, 125);
+    this.scene.add(this.sky.mesh);
   }
 
   private setupLights(): void {
-    const ambient = new THREE.AmbientLight(0xfff6ea, 0.55);
+    const ambient = new THREE.AmbientLight(0xffe8d0, 0.35);
     this.scene.add(ambient);
 
-    const hemi = new THREE.HemisphereLight(0xf2f7ff, 0x7a8a62, 1.55);
+    // Sky-blue from above, warm bounce from the sunlit earth below.
+    const hemi = new THREE.HemisphereLight(0xc4d8f2, 0x8a6e4c, 1.35);
     this.scene.add(hemi);
 
-    const sun = new THREE.DirectionalLight(0xfff1d6, 2.6);
+    // Lower, warmer late-afternoon sun: longer shadows, golden rim light.
+    const sun = new THREE.DirectionalLight(0xffd6a0, 3.4);
     sun.name = "Sun";
-    sun.position.set(22, 34, 16);
+    sun.position.copy(SKY.sunDir).multiplyScalar(45).add(new THREE.Vector3(0, 0, -6));
     sun.target.position.set(0, 0, -6);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
@@ -180,13 +237,13 @@ export class Game {
     this.scene.add(sun);
     this.scene.add(sun.target);
 
-    const fill = new THREE.DirectionalLight(0xd5e4f4, 1.05);
+    const fill = new THREE.DirectionalLight(0xb8cff0, 0.7);
     fill.position.set(-14, 12, -18);
     this.scene.add(fill);
 
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    this.scene.environmentIntensity = 0.5;
+    this.scene.environmentIntensity = 0.4;
     pmrem.dispose();
   }
 
@@ -215,9 +272,10 @@ export class Game {
     this.scene.add(this.axesHelper, this.gridHelper);
   }
 
-  private loop(): void {
+  private loop(time: number): void {
     this.rafId = requestAnimationFrame(this.loop);
-    const delta = Math.min(this.clock.getDelta(), MAX_DELTA);
+    this.timer.update(time);
+    const delta = Math.min(this.timer.getDelta(), MAX_DELTA);
 
     if (this.input.consumePauseToggle()) {
       if (this.paused) {
@@ -230,7 +288,7 @@ export class Game {
     }
 
     if (!this.paused) this.update(delta);
-    this.render();
+    this.render(this.paused ? 0 : delta);
   }
 
   private setPaused(paused: boolean): void {
@@ -248,19 +306,139 @@ export class Game {
       this.gridHelper.visible = this.helpersVisible;
     }
     if (this.input.consumeMuteToggle()) this.audio.toggleMute();
+    if (this.input.consumeFxToggle() && this.postFX) {
+      this.postFX.enabled = !this.postFX.enabled;
+      this.showCallout(this.postFX.enabled ? "Post effects on" : "Post effects off", "info");
+    }
     this.audio.updateListener(this.camera);
 
     const look = this.input.consumeLook();
     const wheel = this.input.consumeWheel();
 
-    this.player.update(delta, this.input, this.camera);
-    this.combatEffects.update(delta);
-    this.enemies.update(delta, this.player);
-    this.updateDefeat(delta);
-    this.audio.updateMusic(delta, this.enemies.isInCombat() && !this.player.isDefeated());
-    this.village?.update(delta);
-    this.nature?.update(delta);
-    this.followCam.update(delta, look.dx, look.dy, wheel);
+    // Hit-stop freezes the world for a few frames; slow-mo stretches it.
+    // The camera keeps real time so shakes and looking stay responsive.
+    const realDelta = delta;
+    let scale = 1;
+    if (this.hitStop > 0) {
+      this.hitStop -= realDelta;
+      scale = 0.03;
+    } else if (this.slowMo > 0) {
+      this.slowMo -= realDelta;
+      // Ease back to full speed over the last 0.25 s.
+      const ease = THREE.MathUtils.clamp(this.slowMo / 0.25, 0, 1);
+      scale = THREE.MathUtils.lerp(1, this.slowScale, ease);
+      if (this.slowMo <= 0) this.dodgeFocus = false;
+    }
+    const gameDelta = delta * scale;
+    this.postFX?.setFocus(this.dodgeFocus && this.slowMo > 0 ? 1 : 0);
+
+    this.player.update(gameDelta, this.input, this.camera);
+    this.combatEffects.update(gameDelta);
+    this.enemies.update(gameDelta, this.player);
+    this.updateDefeat(gameDelta);
+    this.updateCombo(gameDelta);
+    this.updateCounterAura(gameDelta);
+    this.audio.updateMusic(realDelta, this.enemies.isInCombat() && !this.player.isDefeated());
+    this.village?.update(gameDelta);
+    this.nature?.update(gameDelta);
+    this.atmosphere.update(gameDelta, this.player.group.position);
+    this.followCam.update(realDelta, look.dx, look.dy, wheel, this.player.isSprinting());
+    this.sky.update(realDelta, this.camera);
+  }
+
+  /** Every connecting blow: freeze-frame, shake, sparks, a number and the combo meter. */
+  private onEnemyHit(hit: EnemyHit): void {
+    const { attack, killed, at } = hit;
+    let power = attack.kind === "punch" ? 1 : attack.kind === "kick" ? 1.4 : 2;
+    if (attack.finisher) power = Math.max(power, 2);
+    if (attack.counter) power += 1;
+    if (killed) power += 0.5;
+
+    this.hitStop = Math.max(this.hitStop, 0.04 + power * 0.022 + (killed ? 0.05 : 0));
+    this.followCam.addTrauma(0.12 + power * 0.1);
+    if (attack.finisher || killed) this.followCam.kickFov(-4 - power);
+    this.combatEffects.hit(at, this.player.group.position, power, attack.counter);
+    this.combatEffects.damageNumber(
+      at,
+      attack.damage,
+      killed ? "kill" : attack.counter ? "counter" : attack.finisher ? "heavy" : "normal",
+    );
+
+    this.combo++;
+    this.bestCombo = Math.max(this.bestCombo, this.combo);
+    this.comboTimer = COMBO_TIMEOUT;
+    this.renderCombo(true);
+
+    if (attack.counter && !killed) this.showCallout("Counter!", "counter");
+    if (hit.lastOfWave) {
+      // The last kill of a wave plays out in slow motion.
+      this.slowMo = 1.2;
+      this.slowScale = 0.22;
+      this.dodgeFocus = false;
+      window.setTimeout(() => this.showCallout(`Wave ${this.enemies.getWave()} cleared`, "wave"), 350);
+    }
+  }
+
+  /** Rolling just as a blow is about to land: slow time and empower the next strikes. */
+  private checkPerfectDodge(): void {
+    if (!this.enemies.isThreatening(this.player)) return;
+    this.player.grantCounter();
+    this.slowMo = 0.7;
+    this.slowScale = 0.28;
+    this.dodgeFocus = true;
+    this.followCam.kickFov(3);
+    this.audio.play("jump_whoosh", undefined, 0.9);
+    this.showCallout("Shadow Step", "counter");
+  }
+
+  private updateCounterAura(delta: number): void {
+    const ready = this.player.hasCounter();
+    this.hud.counter?.classList.toggle("is-visible", ready);
+    if (!ready) return;
+    this.auraTimer -= delta;
+    if (this.auraTimer > 0) return;
+    this.auraTimer = 0.03;
+    this.combatEffects.aura(this.player.group.position);
+  }
+
+  private updateCombo(delta: number): void {
+    if (this.combo === 0) return;
+    this.comboTimer -= delta;
+    if (this.comboTimer <= 0) this.breakCombo();
+    else this.hud.combo?.style.setProperty("--combo-left", String(this.comboTimer / COMBO_TIMEOUT));
+  }
+
+  private breakCombo(): void {
+    if (this.combo === 0) return;
+    this.combo = 0;
+    this.renderCombo(false);
+  }
+
+  private renderCombo(pop: boolean): void {
+    const { combo, comboCount, comboRank } = this.hud;
+    if (!combo || !comboCount || !comboRank) return;
+    combo.classList.toggle("is-visible", this.combo >= 2);
+    if (this.combo < 2) return;
+    comboCount.textContent = String(this.combo);
+    comboRank.textContent = COMBO_RANKS.find(([min]) => this.combo >= min)?.[1] ?? "";
+    combo.style.setProperty("--combo-left", "1");
+    if (pop) {
+      combo.classList.remove("is-pop");
+      void combo.offsetWidth;
+      combo.classList.add("is-pop");
+    }
+  }
+
+  private showCallout(text: string, kind: "counter" | "wave" | "info"): void {
+    const el = this.hud.callout;
+    if (!el) return;
+    el.textContent = text;
+    el.dataset.kind = kind;
+    el.classList.remove("is-visible");
+    void el.offsetWidth;
+    el.classList.add("is-visible");
+    window.clearTimeout(this.calloutTimeout);
+    this.calloutTimeout = window.setTimeout(() => el.classList.remove("is-visible"), 1300);
   }
 
   private updateDefeat(delta: number): void {
@@ -279,11 +457,13 @@ export class Game {
     this.hud.banner?.classList.remove("is-visible");
     this.player.respawn();
     this.enemies.resetAggro();
+    this.breakCombo();
     this.followCam.syncImmediate();
   }
 
-  private render(): void {
-    this.renderer.render(this.scene, this.camera);
+  private render(delta: number): void {
+    if (this.postFX) this.postFX.render(delta);
+    else this.renderer.render(this.scene, this.camera);
   }
 
   private onResize(): void {
@@ -291,8 +471,12 @@ export class Game {
     const height = window.innerHeight;
     this.camera.aspect = width / Math.max(height, 1);
     this.camera.updateProjectionMatrix();
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const ratio = Math.min(window.devicePixelRatio, 2);
+    this.renderer.setPixelRatio(ratio);
     this.renderer.setSize(width, height);
+    this.postFX?.setSize(width, height, ratio);
+    this.combatEffects.setViewportHeight(height * ratio);
+    this.atmosphere.setViewportHeight(height * ratio);
   }
 
   private loadVillage(): void {
@@ -303,6 +487,7 @@ export class Game {
       this.player.setCollisionMeshes(walls);
       this.enemies.setCollisionMeshes(walls);
 
+      this.atmosphere.attachLanterns(this.scene);
       const nature = new Nature(this.scene);
       this.nature = nature;
       await nature.build();
@@ -334,6 +519,7 @@ export class Game {
     const loader = new GLTFLoader();
     // Start the small move downloads alongside the only mesh and texture file.
     const extraJobs = [
+      ENEMY_PUNCH_URL,
       HERO_NINJA.kickUrl,
       HERO_NINJA.jumpHitUrl,
       HERO_NINJA.idleUrl,
@@ -341,7 +527,6 @@ export class Game {
       HERO_NINJA.jumpUrl,
     ].map((url) => ({ url, promise: loader.loadAsync(url) }));
     const meshPromise = loader.loadAsync(HERO_NINJA.url);
-    const punchPromise = loader.loadAsync(ENEMY_PUNCH_URL);
 
     try {
       const meshGltf = await meshPromise;
@@ -388,13 +573,6 @@ export class Game {
         }
       }),
     );
-
-    try {
-      const punchGltf = await punchPromise;
-      this.enemies.addClips(labelClips(punchGltf.animations, "punch"));
-    } catch (err) {
-      console.error("Failed to load enemy punch clip", err);
-    }
 
     this.setLoadStatus("Ready");
     window.setTimeout(() => this.setLoadStatus(null), 900);
