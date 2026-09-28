@@ -18,10 +18,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (with LFS)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          lfs: true
+
+      # Fetch only the LFS files the build ships. The FBX village kit and the
+      # source Mixamo takes (~550 MB) would otherwise eat LFS bandwidth on every push.
+      - name: Pull shipped LFS assets
+        run: git lfs pull --include="assets/environment/japanese_shrine.glb,assets/environment/japanese_maple_tree.glb,public/favicon.png"
 
       - name: Setup Node
         uses: actions/setup-node@v4

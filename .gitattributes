@@ -2,3 +2,7 @@
 *.glb filter=lfs diff=lfs merge=lfs -text
 *.png filter=lfs diff=lfs merge=lfs -text
 *.jpg filter=lfs diff=lfs merge=lfs -text
+
+# The hero GLBs were committed as regular Git blobs before the LFS rule existed.
+# Keep them that way so re-checking them out never turns into a re-upload.
+public/characters/NINJA*.glb -filter -diff -merge -text
