@@ -1,9 +1,10 @@
 import { defineConfig } from "vite";
 
-// GitHub Pages serves the site at https://wolfxxx.github.io/ClaudeNinja/
+// GitHub Pages serves the site at https://wolfxxx.github.io/Claudeninja/
+// Pages paths are case-sensitive and follow the repo name, so keep the lowercase "n".
 // ARTIFACT=1 builds with relative URLs so the game can be hosted from any folder.
 const pagesBase =
-  process.env.ARTIFACT === "1" ? "./" : process.env.GITHUB_PAGES === "1" ? "/ClaudeNinja/" : "/";
+  process.env.ARTIFACT === "1" ? "./" : process.env.GITHUB_PAGES === "1" ? "/Claudeninja/" : "/";
 
 export default defineConfig({
   base: pagesBase,
