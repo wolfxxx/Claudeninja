@@ -131,7 +131,11 @@ export class Game {
     this.player.onSound = this.audio.play;
     this.player.onAttackEffect = (kind, at, facing) => {
       if (kind === "kick") this.combatEffects.roundhouse(at, facing);
-      else if (kind === "punch") this.combatEffects.jab(at, facing);
+      else if (kind === "punch") {
+        this.combatEffects.jab(at, facing);
+        // A quick zoom-in sells the snap even when the jab whiffs.
+        this.followCam.kickFov(-1.6);
+      }
       else {
         this.combatEffects.slam(at);
         this.followCam.addTrauma(0.35);

@@ -174,6 +174,8 @@ function flashTexture(): THREE.Texture {
 
 const tmpColor = new THREE.Color();
 const tmpVec = new THREE.Vector3();
+/** Fist height above the feet at full extension of the jab take. */
+const JAB_HEIGHT = 1.3;
 
 /** Short, readable attack cues built from geometry and particles, with no extra downloads. */
 export class CombatEffects {
@@ -207,22 +209,70 @@ export class CombatEffects {
     this.bursts.push({ mesh, age: 0, life: 0.28, start: 0.8, end: 1.4, opacity: 0.78 });
   }
 
-  /** A short bright streak in front of the fist. */
+  /**
+   * Fired as the fist reaches full extension: a white-hot streak along the punch
+   * line, a shock ring bursting off the knuckles, a flash and a spray of sparks.
+   */
   jab(at: THREE.Vector3, facing: number): void {
-    const geometry = new THREE.TorusGeometry(0.9, 0.04, 5, 24, Math.PI * 0.55);
-    const material = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(2, 1.7, 1.2),
-      transparent: true,
-      opacity: 0.7,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      blending: THREE.AdditiveBlending,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.rotation.set(-Math.PI / 2, 0, facing - Math.PI * 0.27 - Math.PI / 2);
-    mesh.position.copy(at).add(new THREE.Vector3(Math.sin(facing) * 0.4, 1.25, Math.cos(facing) * 0.4));
-    this.scene.add(mesh);
-    this.bursts.push({ mesh, age: 0, life: 0.16, start: 0.7, end: 1.25, opacity: 0.7 });
+    const fx = Math.sin(facing);
+    const fz = Math.cos(facing);
+    const additive = (color: THREE.Color, opacity: number) =>
+      new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+      });
+
+    // Streak: thin at the shoulder, widest at the fist. Built along +Z, then yawed.
+    const streakGeo = new THREE.ConeGeometry(0.075, 1.15, 10, 1, true);
+    streakGeo.rotateX(-Math.PI / 2);
+    const streak = new THREE.Mesh(streakGeo, additive(new THREE.Color(2.4, 2.1, 1.7), 0.85));
+    streak.rotation.y = facing;
+    streak.position.copy(at).add(tmpVec.set(fx * 0.4, JAB_HEIGHT, fz * 0.4));
+    this.scene.add(streak);
+    this.bursts.push({ mesh: streak, age: 0, life: 0.09, start: 1, end: 1.12, opacity: 0.85 });
+
+    // Shock ring facing along the punch, just past the knuckles.
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.16, 0.23, 36), additive(new THREE.Color(2.2, 1.8, 1.3), 0.9));
+    ring.rotation.y = facing;
+    const fist = tmpVec.set(at.x + fx * 1.0, at.y + JAB_HEIGHT, at.z + fz * 1.0);
+    ring.position.copy(fist);
+    this.scene.add(ring);
+    this.bursts.push({ mesh: ring, age: 0, life: 0.2, start: 0.5, end: 2.6, opacity: 0.9 });
+
+    const flash = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: flashTexture(),
+        color: new THREE.Color(2.2, 1.9, 1.5),
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+      }),
+    );
+    flash.position.copy(fist);
+    flash.renderOrder = 7;
+    this.scene.add(flash);
+    this.bursts.push({ mesh: flash, age: 0, life: 0.08, start: 0.45, end: 0.9, opacity: 0.9 });
+
+    for (let i = 0; i < 10; i++) {
+      const spread = (Math.random() - 0.5) * 0.7;
+      const s = 7 + Math.random() * 6;
+      tmpColor.setRGB(2.4, 1.6 + Math.random() * 0.6, 0.7 + Math.random() * 0.4);
+      this.sparks.emit(
+        fist,
+        (fx - fz * spread) * s,
+        (Math.random() - 0.3) * 2.5,
+        (fz + fx * spread) * s,
+        tmpColor,
+        0.05 + Math.random() * 0.04,
+        0.12 + Math.random() * 0.12,
+        4,
+        6,
+      );
+    }
   }
 
   slam(at: THREE.Vector3): void {

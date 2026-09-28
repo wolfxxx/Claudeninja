@@ -75,6 +75,17 @@ export type PlayerAttack = {
 const COMBO: ReadonlyArray<"punch" | "kick"> = ["punch", "punch", "kick"];
 
 /**
+ * Phases of each strike take, as fractions of the clip, measured from the Mixamo
+ * files. The jab take opens with a long pull-back (fist furthest back at 0.36,
+ * fully out at 0.58), so it starts already chambered and hits almost at once.
+ */
+const STRIKE_PHASES = {
+  punch: { start: 0.4, whoosh: 0.4, effect: 0.53, hitFrom: 0.48, hitTo: 0.68, chainAt: 0.62, end: 0.8 },
+  // The roundhouse leg is fully out from 0.24 to 0.40.
+  kick: { start: 0, whoosh: 0.18, effect: 0.27, hitFrom: 0.22, hitTo: 0.5, chainAt: 0.8, end: 0.88 },
+} as const;
+
+/**
  * Player transform lives on `group` (origin at the feet).
  * Call `setModel()` after loading a fitted GLB; movement code stays the same.
  */
@@ -246,8 +257,9 @@ export class Player {
       if (!action) return null;
       const t = action.time / action.getClip().duration;
       const mult = this.strikeCounter ? COUNTER_MULTIPLIER : 1;
+      const phases = STRIKE_PHASES[this.strike];
+      if (t < phases.hitFrom || t > phases.hitTo) return null;
       if (this.strike === "punch") {
-        if (t < 0.24 || t > 0.56) return null;
         return {
           id: this.attackSerial,
           kind: "punch",
@@ -257,7 +269,6 @@ export class Player {
           counter: this.strikeCounter,
         };
       }
-      if (t < 0.3 || t > 0.7) return null;
       const finisher = this.isFinisher();
       return {
         id: this.attackSerial,
@@ -908,6 +919,7 @@ export class Player {
     this.velocity.z = Math.cos(yaw) * lunge;
 
     action.reset();
+    action.time = STRIKE_PHASES[kind].start * action.getClip().duration;
     action.timeScale =
       kind === "kick" ? KICK_TIME_SCALE * (this.isFinisher() ? 1.08 : 1) : PUNCH_TIME_SCALE * (this.comboStep === 1 ? 1.15 : 1);
     action.play();
@@ -925,12 +937,13 @@ export class Player {
     const dur = action.getClip().duration;
     const t = action.time / dur;
     const isKick = this.strike === "kick";
+    const phases = STRIKE_PHASES[this.strike];
 
-    if (!this.kickWhooshed && t >= (isKick ? 0.18 : 0.16)) {
+    if (!this.kickWhooshed && t >= phases.whoosh) {
       this.kickWhooshed = true;
       this.onSound?.(isKick ? "kick_whoosh" : "enemy_whoosh", this.group.position, isKick ? 1 : 0.8);
     }
-    if (!this.kickEffectPlayed && t >= (isKick ? 0.27 : 0.24)) {
+    if (!this.kickEffectPlayed && t >= phases.effect) {
       this.kickEffectPlayed = true;
       this.onAttackEffect?.(this.strike, this.group.position, this.group.rotation.y);
     }
@@ -939,9 +952,9 @@ export class Player {
       this.model.rotation.y = this.modelBaseRotationY + spin * Math.PI * 2;
     }
 
-    // Jabs can be chained early; the roundhouse must finish.
-    const cancelAt = isKick ? 0.88 : 0.6;
-    if (this.comboQueued && t >= (isKick ? 0.8 : 0.46)) {
+    // A queued jab follows as soon as this blow has landed; the roundhouse must finish.
+    const cancelAt = phases.end;
+    if (this.comboQueued && t >= phases.chainAt) {
       this.strike = null;
       if (this.model) this.model.rotation.y = this.modelBaseRotationY;
       this.startStrike();
