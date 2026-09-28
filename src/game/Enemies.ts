@@ -165,7 +165,15 @@ export class EnemyManager {
   onHit: ((hit: EnemyHit) => void) | null = null;
   onWave: ((wave: number) => void) | null = null;
   onSound: SoundHook | null = null;
+  /** Compiles and first-draws an object that is not in the scene, as the main scene would draw it. */
+  prewarm: ((root: THREE.Object3D) => Promise<void>) | null = null;
   private readonly emit: SoundHook = (name, at, volume) => this.onSound?.(name, at, volume);
+  /**
+   * One off-scene, never-disposed enemy per archetype. Its materials keep the
+   * Red Clan shader programs alive between waves; otherwise three.js frees them when
+   * the last enemy is disposed and the next wave stalls for a recompile.
+   */
+  private shaderKeepAlive: THREE.Group | null = null;
 
   constructor(private readonly scene: THREE.Scene) {}
 
@@ -222,6 +230,7 @@ export class EnemyManager {
       if (!this.template || !this.clips.has("idle") || !this.clips.has("run")) return;
       this.started = true;
       this.calmTimer = ENEMY_FIRST_WAVE_DELAY;
+      this.warmShaders();
     }
 
     this.warnOfPlayerAttack(player);
@@ -248,6 +257,28 @@ export class EnemyManager {
   /** Called after the player respawns so the fight restarts at a distance. */
   resetAggro(): void {
     for (const enemy of this.enemies) enemy.calmDown();
+  }
+
+  /**
+   * Compile every archetype's shaders during the calm before the first wave.
+   * Runs once both the enemy template and prewarm are ready, whichever comes last.
+   */
+  warmShaders(): void {
+    if (!this.template || !this.prewarm || this.shaderKeepAlive) return;
+    const root = new THREE.Group();
+    for (const archetype of Object.keys(ARCHETYPES) as Archetype[]) {
+      const enemy = new Enemy(cloneSkinned(this.template), this.clips, this.emit, {
+        ...rollTraits(1),
+        archetype,
+      });
+      root.add(enemy.group);
+    }
+    // compile() skips hidden objects; the telegraph glint starts hidden.
+    root.traverse((obj) => {
+      obj.visible = true;
+    });
+    this.shaderKeepAlive = root;
+    this.prewarm(root).catch((err) => console.warn("Enemy shader warm-up failed", err));
   }
 
   /** Each wave is one bigger than the last, up to ENEMY_MAX_WAVE_SIZE. */
@@ -1230,7 +1261,9 @@ class Enemy {
       const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color, roughness: 0.65, metalness: 0.22 }));
       mesh.position.set(x, y, z);
       mesh.rotation.z = rz;
-      mesh.castShadow = true;
+      // Too thin to cast a visible shadow, and a shadow here needs its own depth
+      // shader, which would compile mid-fight when the first wave appears.
+      mesh.castShadow = false;
       this.body.add(mesh);
       this.ornaments.push(mesh);
     };

@@ -488,6 +488,10 @@ export class Game {
       this.enemies.setCollisionMeshes(walls);
 
       this.atmosphere.attachLanterns(this.scene);
+      // Shader programs are keyed on the scene's light count, so warm the enemy
+      // shaders only once the lantern lights are in.
+      this.enemies.prewarm = (root) => this.postFX?.prewarm(root) ?? Promise.resolve();
+      this.enemies.warmShaders();
       const nature = new Nature(this.scene);
       this.nature = nature;
       await nature.build();

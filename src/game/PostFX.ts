@@ -124,6 +124,35 @@ export class PostFX {
     this.composer.render(delta);
   }
 
+  /**
+   * Get objects that are not in the scene yet ready to appear without a stall.
+   * Shaders are compiled for both paths that can draw them: the linear HDR target
+   * (effects on) and the screen (effects off), since three.js keys programs on the
+   * render target bound at compile time. Then the objects are drawn once off-screen,
+   * with the scene's lights and shadows, because drivers still do per-program setup
+   * on the first real draw.
+   */
+  async prewarm(root: THREE.Object3D): Promise<void> {
+    const previous = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.composer.readBuffer);
+    const hdr = this.renderer.compileAsync(root, this.camera, this.scene);
+    this.renderer.setRenderTarget(null);
+    const screen = this.renderer.compileAsync(root, this.camera, this.scene);
+    this.renderer.setRenderTarget(previous);
+    await Promise.all([hdr, screen]);
+
+    const target = new THREE.WebGLRenderTarget(16, 16, { type: THREE.HalfFloatType });
+    // In front of the camera so frustum culling keeps every part in the draw.
+    root.position.copy(this.camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(4)).add(this.camera.position);
+    this.scene.add(root);
+    const current = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(target);
+    this.renderer.render(this.scene, this.camera);
+    this.renderer.setRenderTarget(current);
+    this.scene.remove(root);
+    target.dispose();
+  }
+
   dispose(): void {
     this.composer.dispose();
   }
