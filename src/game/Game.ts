@@ -5,6 +5,7 @@ import { ENEMY_PUNCH_URL, HERO_NINJA } from "./characterCatalog";
 import { Atmosphere } from "./Atmosphere";
 import { GameAudio } from "./Audio";
 import { CombatEffects } from "./CombatEffects";
+import { JUMP_HIT_REACH, ORB_HEAL_COUNTER, ORB_HEAL_KILL, WAVE_CLEAR_HEAL } from "./constants";
 import { EnemyManager, type EnemyHit } from "./Enemies";
 import { fitCharacter } from "./fitCharacter";
 import { Input } from "./Input";
@@ -13,6 +14,7 @@ import { Player } from "./Player";
 import { PostFX } from "./PostFX";
 import { SKY, SkyDome } from "./Sky";
 import { ThirdPersonCamera } from "./ThirdPersonCamera";
+import { UPGRADES, UpgradePick, freshMods, rollChoices } from "./Upgrades";
 import { Village } from "./Village";
 
 const MAX_DELTA = 0.05;
@@ -21,6 +23,9 @@ const LOAD_HERO_GLB = true;
 
 /** Seconds without landing a blow before the combo meter drops. */
 const COMBO_TIMEOUT = 2.6;
+/** Best wave reached, kept in this browser between visits. */
+const BEST_WAVE_KEY = "claudeninja.bestWave";
+
 const COMBO_RANKS: ReadonlyArray<[number, string]> = [
   [20, "影 Shadow Legend"],
   [14, "Sublime"],
@@ -45,6 +50,10 @@ export class Game {
   private readonly combatEffects = new CombatEffects(this.scene);
   private readonly sky = new SkyDome();
   private readonly atmosphere = new Atmosphere(this.scene);
+  private readonly upgradePick = new UpgradePick();
+  /** Upgrades taken this run, by id, with how many times. */
+  private readonly taken = new Map<string, number>();
+  private bestWave = readBestWave();
   private postFX: PostFX | null = null;
 
   /** Real seconds of near-frozen time after a blow lands. */
@@ -74,6 +83,7 @@ export class Game {
     callout: document.getElementById("callout"),
     counter: document.getElementById("counter-ready"),
     wave: document.getElementById("wave"),
+    upgrades: document.getElementById("upgrades"),
   };
   private paused = false;
   /** Only auto-pause on Esc once the player has actually started playing. */
@@ -137,11 +147,20 @@ export class Game {
         this.followCam.kickFov(-1.6);
       }
       else {
-        this.combatEffects.slam(at);
+        this.combatEffects.slam(at, (JUMP_HIT_REACH + this.player.mods.slamReach) / JUMP_HIT_REACH);
         this.followCam.addTrauma(0.35);
       }
     };
     this.player.onDust = (at, amount) => this.combatEffects.dust(at, amount);
+    this.combatEffects.orbTarget = this.player.group.position;
+    this.combatEffects.onOrbCollect = (heal) => this.player.heal(heal);
+    this.enemies.onBlock = (at) => {
+      this.combatEffects.block(at);
+      this.followCam.addTrauma(0.25);
+      this.hitStop = Math.max(this.hitStop, 0.06);
+      this.breakCombo();
+      this.showCallout("Guarded", "info");
+    };
     this.player.findTarget = (from, range) => this.enemies.nearestAlivePosition(from, range);
     this.player.onRollStart = () => this.checkPerfectDodge();
     this.enemies.onHit = (hit) => this.onEnemyHit(hit);
@@ -193,6 +212,7 @@ export class Game {
     this.combatEffects.dispose();
     this.atmosphere.dispose();
     this.sky.dispose();
+    this.upgradePick.dispose();
   }
 
   private setupRenderer(): void {
@@ -353,6 +373,7 @@ export class Game {
   /** Every connecting blow: freeze-frame, shake, sparks, a number and the combo meter. */
   private onEnemyHit(hit: EnemyHit): void {
     const { attack, killed, at } = hit;
+    this.player.markStrikeLanded(attack.id);
     let power = attack.kind === "punch" ? 1 : attack.kind === "kick" ? 1.4 : 2;
     if (attack.finisher) power = Math.max(power, 2);
     if (attack.counter) power += 1;
@@ -373,19 +394,70 @@ export class Game {
     this.comboTimer = COMBO_TIMEOUT;
     this.renderCombo(true);
 
-    if (attack.counter && !killed) this.showCallout("Counter!", "counter");
+    if (hit.guardBreak) {
+      this.showCallout("Guard Break!", "counter");
+      this.followCam.addTrauma(0.3);
+    } else if (attack.counter && !killed) this.showCallout("Counter!", "counter");
+
+    // Health only comes back from fighting well: kills, and counters above all.
+    const counterHeal = attack.counter ? ORB_HEAL_COUNTER + this.player.mods.counterHeal : 0;
+    const killHeal = killed ? ORB_HEAL_KILL : 0;
+    if (counterHeal + killHeal > 0) {
+      this.combatEffects.healOrbs(at, counterHeal + killHeal, killed ? (attack.counter || attack.finisher ? 3 : 2) : 1);
+    }
+
     if (hit.lastOfWave) {
-      // The last kill of a wave plays out in slow motion.
+      // The last kill of a wave plays out in slow motion, then a technique is chosen.
       this.slowMo = 1.2;
       this.slowScale = 0.22;
       this.dodgeFocus = false;
-      window.setTimeout(() => this.showCallout(`Wave ${this.enemies.getWave()} cleared`, "wave"), 350);
+      this.enemies.holdWaves = true;
+      const wave = this.enemies.getWave();
+      window.setTimeout(() => this.showCallout(`Wave ${wave} cleared`, "wave"), 350);
+      window.setTimeout(() => this.offerUpgrade(), 1700);
     }
+  }
+
+  /** Between waves: heal a little and pick one of three techniques. */
+  private offerUpgrade(): void {
+    if (this.player.isDefeated()) return;
+    const { max } = this.player.getHealth();
+    this.player.heal(max * WAVE_CLEAR_HEAL);
+    const choices = rollChoices(this.taken);
+    if (choices.length === 0) {
+      this.enemies.holdWaves = false;
+      return;
+    }
+    this.upgradePick.open(choices, (upgrade) => {
+      upgrade.apply(this.player.mods);
+      this.taken.set(upgrade.id, (this.taken.get(upgrade.id) ?? 0) + 1);
+      if (upgrade.id === "tempered") this.player.heal(this.player.maxHp);
+      this.renderUpgrades();
+      this.showCallout(upgrade.name, "wave");
+      this.enemies.holdWaves = false;
+    });
+  }
+
+  private renderUpgrades(): void {
+    const list = this.hud.upgrades;
+    if (!list) return;
+    list.replaceChildren(
+      ...[...this.taken].map(([id, count]) => {
+        const chip = document.createElement("span");
+        const name = UPGRADES.find((u) => u.id === id)?.name ?? id;
+        chip.textContent = count > 1 ? `${name} ×${count}` : name;
+        return chip;
+      }),
+    );
   }
 
   /** Rolling just as a blow is about to land: slow time and empower the next strikes. */
   private checkPerfectDodge(): void {
-    if (!this.enemies.isThreatening(this.player)) return;
+    if (!this.enemies.isThreatening(this.player)) {
+      // Ghost Roll: any roll primes a short, quiet counter.
+      if (this.player.mods.ghostRoll) this.player.grantCounter(0.5);
+      return;
+    }
     this.player.grantCounter();
     this.slowMo = 0.7;
     this.slowScale = 0.28;
@@ -458,11 +530,34 @@ export class Game {
     this.defeatTimer += delta;
     if (this.defeatTimer < 2.2) return;
     this.defeatTimer = 0;
-    this.hud.banner?.classList.remove("is-visible");
+    this.restartRun();
+  }
+
+  /** Defeat ends the run: upgrades are lost and the Red Clan starts again from wave 1. */
+  private restartRun(): void {
+    const reached = this.enemies.getWave();
+    if (reached > this.bestWave) {
+      this.bestWave = reached;
+      try {
+        localStorage.setItem(BEST_WAVE_KEY, String(reached));
+      } catch {
+        // Storage can be unavailable (private mode); the best wave just won't persist.
+      }
+    }
+    this.player.mods = freshMods();
+    this.taken.clear();
+    this.renderUpgrades();
     this.player.respawn();
-    this.enemies.resetAggro();
+    this.enemies.reset();
     this.breakCombo();
     this.followCam.syncImmediate();
+    if (this.hud.wave) this.hud.wave.textContent = `Best: wave ${this.bestWave}`;
+    const banner = this.hud.banner;
+    if (banner) {
+      banner.textContent = `Fell on wave ${reached} · best ${this.bestWave}`;
+      window.clearTimeout(this.bannerTimeout);
+      this.bannerTimeout = window.setTimeout(() => banner.classList.remove("is-visible"), 2600);
+    }
   }
 
   private render(delta: number): void {
@@ -614,4 +709,12 @@ function labelClips(
       clip.name = fallbackName;
       return clip;
     });
+}
+
+function readBestWave(): number {
+  try {
+    return Number(localStorage.getItem(BEST_WAVE_KEY)) || 0;
+  } catch {
+    return 0;
+  }
 }

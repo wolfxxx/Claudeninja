@@ -6,11 +6,15 @@ import {
   ENEMY_CIRCLE_RADIUS,
   ENEMY_DAMAGE,
   ENEMY_FIRST_WAVE_DELAY,
+  ENEMY_GUARD_TIME,
+  ENEMY_HEAVY_DAMAGE,
   ENEMY_HEIGHT,
   ENEMY_HP,
   ENEMY_LEAP_DAMAGE,
   ENEMY_MAX_ATTACKERS,
   ENEMY_MAX_WAVE_SIZE,
+  ENEMY_POISE_HITS,
+  ENEMY_POISE_TIME,
   ENEMY_REACH,
   ENEMY_SPEED,
   ENEMY_WAVE_BREAK,
@@ -37,6 +41,7 @@ type EnemyState =
   | "evade"
   | "recover"
   | "hurt"
+  | "guard"
   | "dead";
 
 const CLIP_NAMES: readonly EnemyClip[] = ["idle", "run", "punch", "kick", "roll", "jump", "jumphit"];
@@ -72,12 +77,19 @@ type Traits = {
   combo: number;
   /** Chance to roll or hop back out after a strike instead of standing there. */
   retreat: number;
+  /** Duelists: chance to raise a guard against a strike instead of dodging it. */
+  guard: number;
+  /** Brawlers: chance an attack is an armored heavy blow. */
+  heavy: number;
+  maxHp: number;
 };
 
 const ARCHETYPES: Record<Archetype, Omit<Traits, "archetype">> = {
-  brawler: { speed: 0.95, aggression: 1.25, dodge: 0.3, leap: 0.3, rollIn: 0.4, combo: 0.6, retreat: 0.15 },
-  acrobat: { speed: 1.12, aggression: 0.95, dodge: 0.7, leap: 0.7, rollIn: 0.5, combo: 0.25, retreat: 0.55 },
-  duelist: { speed: 1.0, aggression: 1.05, dodge: 0.5, leap: 0.45, rollIn: 0.4, combo: 0.4, retreat: 0.35 },
+  // Each role asks for a different answer: roll the brawler's heavies, slam or sweep the
+  // acrobat that dodges jabs, and Shadow Step or flank the duelist's guard.
+  brawler: { maxHp: ENEMY_HP, speed: 0.95, aggression: 1.25, dodge: 0.15, leap: 0.3, rollIn: 0.4, combo: 0.6, retreat: 0.15, guard: 0, heavy: 0.4 },
+  acrobat: { maxHp: ENEMY_HP, speed: 1.12, aggression: 0.95, dodge: 0.7, leap: 0.7, rollIn: 0.5, combo: 0.25, retreat: 0.55, guard: 0, heavy: 0 },
+  duelist: { maxHp: ENEMY_HP, speed: 1.0, aggression: 1.05, dodge: 0.3, leap: 0.45, rollIn: 0.4, combo: 0.4, retreat: 0.35, guard: 0.6, heavy: 0 },
 };
 
 function rollTraits(wave: number): Traits {
@@ -95,10 +107,14 @@ function rollTraits(wave: number): Traits {
     rollIn: base.rollIn * jitter(),
     combo: Math.min(base.combo * jitter() + level * 0.05, 0.85),
     retreat: base.retreat * jitter(),
+    guard: base.guard > 0 ? Math.min(base.guard + level * 0.05, 0.9) : 0,
+    heavy: base.heavy > 0 ? Math.min(base.heavy + level * 0.05, 0.75) : 0,
+    maxHp: base.maxHp + Math.floor(level / 2),
   };
 }
 
 const rand = (min: number, max: number) => min + Math.random() * (max - min);
+const tmpFrom = new THREE.Vector3();
 
 /** Height of the telegraph glint and health bar above an enemy's feet. */
 const HEAD_Y = ENEMY_HEIGHT + 0.12;
@@ -141,6 +157,8 @@ export type EnemyHit = {
   killed: boolean;
   /** True when this kill emptied the wave. */
   lastOfWave: boolean;
+  /** The blow smashed through a duelist's guard. */
+  guardBreak: boolean;
 };
 
 /**
@@ -164,7 +182,11 @@ export class EnemyManager {
   /** Every connecting player blow, for hit-stop, sparks, numbers and the combo meter. */
   onHit: ((hit: EnemyHit) => void) | null = null;
   onWave: ((wave: number) => void) | null = null;
+  /** A player strike bounced off a duelist's guard. */
+  onBlock: ((at: THREE.Vector3) => void) | null = null;
   onSound: SoundHook | null = null;
+  /** While true (the upgrade pick is open) the next wave waits. */
+  holdWaves = false;
   /** Compiles and first-draws an object that is not in the scene, as the main scene would draw it. */
   prewarm: ((root: THREE.Object3D) => Promise<void>) | null = null;
   private readonly emit: SoundHook = (name, at, volume) => this.onSound?.(name, at, volume);
@@ -247,16 +269,22 @@ export class EnemyManager {
       this.enemies.splice(i, 1);
     }
 
-    if (this.enemies.some((e) => !e.isDead())) return;
+    if (this.enemies.some((e) => !e.isDead()) || this.holdWaves) return;
     this.calmTimer -= delta;
     if (this.calmTimer > 0) return;
     this.calmTimer = ENEMY_WAVE_BREAK;
     this.spawnWave(player.group.position);
   }
 
-  /** Called after the player respawns so the fight restarts at a distance. */
-  resetAggro(): void {
-    for (const enemy of this.enemies) enemy.calmDown();
+  /** A new run: clear the field and start again from wave 1. */
+  reset(): void {
+    for (const enemy of this.enemies) enemy.dispose(this.scene);
+    this.enemies.length = 0;
+    this.wave = 0;
+    this.kills = 0;
+    this.holdWaves = false;
+    this.calmTimer = ENEMY_FIRST_WAVE_DELAY;
+    this.onKill?.(0);
   }
 
   /**
@@ -361,9 +389,18 @@ export class EnemyManager {
       if (Math.abs(p.y - enemy.group.position.y) > 1.6) continue;
       if (attack.kind === "punch" && dist > 0.6 && (dx * fx + dz * fz) / dist < 0.25) continue;
 
-      const result = enemy.hurt(attack.damage, p.x, p.z, attack.finisher);
+      const result = enemy.hurt(attack.damage, p.x, p.z, attack.finisher, attack.breaksGuard);
       if (result === "dodged") continue;
       enemy.lastHitBy = attack.id;
+      if (result === "blocked") {
+        const at = enemy.group.position.clone();
+        at.x -= (dx / Math.max(dist, 1e-3)) * 0.5;
+        at.z -= (dz / Math.max(dist, 1e-3)) * 0.5;
+        at.y += ENEMY_HEIGHT * 0.62;
+        player.recoil(enemy.group.position.x, enemy.group.position.z);
+        this.onBlock?.(at);
+        continue;
+      }
       const killed = result === "killed";
       if (killed) {
         this.kills++;
@@ -376,6 +413,7 @@ export class EnemyManager {
         attack,
         killed,
         lastOfWave: killed && this.enemies.every((e) => e.isDead()),
+        guardBreak: result === "broke",
       });
     }
   }
@@ -453,7 +491,9 @@ class Enemy {
   private readonly rayDir = new THREE.Vector3();
   private readonly rayNormal = new THREE.Vector3();
 
-  private hp = ENEMY_HP;
+  private hp: number;
+  /** Seconds left powering through: jabs hurt but no longer interrupt. */
+  private poiseTimer = 0;
   private state: EnemyState = "idle";
   private stateTime = 0;
   private current: EnemyClip = "idle";
@@ -468,6 +508,14 @@ class Enemy {
   private dodgeCooldown = 0;
   private attackClip: EnemyClip = "punch";
   private attackLanded = false;
+  /** Brawler heavy blow in progress: armored, red telegraph, big damage. */
+  private heavy = false;
+  /** Duelist guard: a hex ward in front that stops frontal strikes. */
+  private readonly ward: THREE.Group;
+  private readonly wardMaterials: THREE.MeshBasicMaterial[] = [];
+  private guardTimer = 0;
+  private guardBlocks = 0;
+  private wardFlash = 0;
   private comboUsed = false;
   private whooshed = false;
   private fellDown = false;
@@ -502,6 +550,7 @@ class Enemy {
     private readonly traits: Traits,
   ) {
     this.group.name = `RedClan_${traits.archetype}`;
+    this.hp = traits.maxHp;
     this.body = new THREE.Group();
     this.body.add(body);
     this.group.add(this.body);
@@ -551,8 +600,35 @@ class Enemy {
     this.group.add(this.bar);
     this.drawBar();
 
+    this.ward = this.buildWard();
+    this.group.add(this.ward);
+
     this.mixer = new THREE.AnimationMixer(body);
     this.bindClips(clips);
+  }
+
+  /** Six-sided ward held at chest height toward the player. Only duelists raise it. */
+  private buildWard(): THREE.Group {
+    const ward = new THREE.Group();
+    const make = (geometry: THREE.BufferGeometry, opacity: number) => {
+      const material = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0.9, 1.6, 2.4),
+        transparent: true,
+        opacity,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+      });
+      material.userData.base = opacity;
+      this.wardMaterials.push(material);
+      ward.add(new THREE.Mesh(geometry, material));
+    };
+    make(new THREE.RingGeometry(0.36, 0.46, 6), 0.9);
+    make(new THREE.CircleGeometry(0.36, 6), 0.18);
+    ward.position.set(0, ENEMY_HEIGHT * 0.62, 0.55);
+    ward.rotation.z = Math.PI / 6;
+    ward.visible = false;
+    return ward;
   }
 
   bindClips(clips: ReadonlyMap<EnemyClip, THREE.AnimationClip>): void {
@@ -594,22 +670,22 @@ class Enemy {
   threatens(p: THREE.Vector3): boolean {
     const dist = this.distanceTo(p);
     if (this.state === "attack") {
-      return this.attackProgress > 0.1 && this.attackProgress < 0.58 && dist < ENEMY_REACH + 1.1;
+      const reach = ENEMY_REACH + (this.heavy ? 0.35 : 0) + 1.1;
+      return this.attackProgress > 0.1 && this.attackProgress < 0.58 && dist < reach;
     }
     if (this.state === "leap") return this.stateTime > 0.2 && dist < 4.2;
     return false;
   }
 
-  calmDown(): void {
-    if (this.state === "dead") return;
-    this.setState("idle");
-    this.cooldown = 1.5;
-    this.pendingDodge = -1;
-    this.alerted = false;
-  }
-
-  /** The player started a strike nearby; maybe react after a human-ish delay. */
+  /** The player started a strike nearby; maybe guard, or dodge after a human-ish delay. */
   considerDodge(kind: StrikeKind, from: THREE.Vector3): void {
+    if (this.state === "guard") return;
+    if (kind !== "jumphit" && this.traits.guard > 0 && this.canEvadeNow() && this.facing(from) > 0.3) {
+      if (Math.random() < this.traits.guard) {
+        this.startGuard();
+        return;
+      }
+    }
     if (this.pendingDodge >= 0 || this.dodgeCooldown > 0) return;
     if (!this.canEvadeNow()) return;
     if (!this.actions.has("roll") && !this.actions.has("jump")) return;
@@ -619,21 +695,70 @@ class Enemy {
     this.lastThreat.copy(from);
   }
 
-  hurt(damage: number, fromX: number, fromZ: number, heavy = false): "hit" | "killed" | "dodged" {
+  hurt(
+    damage: number,
+    fromX: number,
+    fromZ: number,
+    heavy = false,
+    breaksGuard = false,
+  ): "hit" | "killed" | "dodged" | "blocked" | "broke" {
     if (this.state === "dead") return "dodged";
     if (this.state === "evade" && this.evadeKind !== "rollIn") return "dodged";
 
-    this.hp -= damage;
-    this.flash = 1;
-    this.pendingDodge = -1;
+    let broke = false;
+    if (this.state === "guard") {
+      // Frontal blows bounce off; counters, the slam and hits from behind go through.
+      const fromBehind = this.facing(tmpFrom.set(fromX, 0, fromZ)) < -0.1;
+      if (!breaksGuard && !fromBehind) {
+        this.guardBlocks++;
+        this.guardTimer = Math.max(this.guardTimer, 0.45);
+        this.wardFlash = 1;
+        this.sound("hit_kick", this.group.position, 0.55);
+        return "blocked";
+      }
+      broke = true;
+      heavy = true;
+    }
 
     this.hitStreak = this.clock - this.lastHitAt < 1.3 ? this.hitStreak + 1 : 1;
     this.lastHitAt = this.clock;
 
+    // Juggled too long, they stop flinching and swing back: read the glint and roll.
+    // A plain chain's roundhouse no longer bails you out; only counters, the slam and
+    // guard breaks still knock them off their feet.
+    const staggers = breaksGuard;
+    if (!staggers && this.poiseTimer <= 0 && this.hitStreak >= ENEMY_POISE_HITS && this.state !== "attack") {
+      this.poiseTimer = ENEMY_POISE_TIME;
+      if (this.hp > damage) this.startAttack(false);
+    }
+
+    // Mid heavy blow, or powering through, they shrug off hits: they still hurt, but won't stop the swing.
+    const armored =
+      (this.state === "attack" && this.heavy && this.attackProgress < 0.62) || (this.poiseTimer > 0 && !staggers);
+    if (armored) {
+      this.hp -= damage;
+      this.flash = 1;
+      this.barShown = 1;
+      this.barDamage = 1;
+      this.drawBar();
+      this.sound("hit_kick", this.group.position, 0.7);
+      if (this.hp > 0) return "hit";
+      this.sound("enemy_death", this.group.position);
+      this.glint.visible = false;
+      this.setState("dead");
+      return "killed";
+    }
+
+    this.hp -= damage;
+    this.flash = 1;
+    this.pendingDodge = -1;
+    this.poiseTimer = 0;
+
     const dx = this.group.position.x - fromX;
     const dz = this.group.position.z - fromZ;
     const len = Math.hypot(dx, dz) || 1;
-    const knock = heavy ? 11.5 : damage > 1 ? 8.5 : 5;
+    // Jabs only nudge, so a target stays close enough to swing back.
+    const knock = heavy ? 11.5 : damage > 1 ? 8.5 : 3;
     this.velocity.x = (dx / len) * knock;
     this.velocity.z = (dz / len) * knock;
     // Finishers pop the target off its feet.
@@ -653,10 +778,28 @@ class Enemy {
     }
     this.sound("enemy_hurt", this.group.position);
     this.lean = heavy ? 0.85 : damage > 1 ? 0.55 : 0.35;
-    // Getting juggled? Sometimes they break out with a quick evade instead of taking a third hit.
-    this.breakAway = this.hitStreak >= 2 && Math.random() < 0.35 + this.traits.dodge * 0.5;
+    // Acrobats slip out of a juggle with a quick evade; the others power through (poise).
+    this.breakAway =
+      !broke && this.traits.archetype === "acrobat" && this.hitStreak >= 2 && Math.random() < this.traits.dodge * 0.8;
     this.setState("hurt");
-    return "hit";
+    return broke ? "broke" : "hit";
+  }
+
+  /** Cosine between this enemy's facing and the direction to `p` (1 = straight ahead). */
+  private facing(p: THREE.Vector3): number {
+    const dx = p.x - this.group.position.x;
+    const dz = p.z - this.group.position.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 1e-3) return 1;
+    return (dx * Math.sin(this.group.rotation.y) + dz * Math.cos(this.group.rotation.y)) / d;
+  }
+
+  private startGuard(): void {
+    this.pendingDodge = -1;
+    this.guardTimer = ENEMY_GUARD_TIME;
+    this.guardBlocks = 0;
+    this.wardFlash = 0.6;
+    this.setState("guard");
   }
 
   update(
@@ -671,9 +814,25 @@ class Enemy {
     this.cooldown -= delta;
     this.leapCooldown -= delta;
     this.dodgeCooldown -= delta;
+    this.poiseTimer = Math.max(0, this.poiseTimer - delta);
     this.flash = Math.max(0, this.flash - delta * 4);
+    // A heavy blow smoulders red through its wind-up; powering through glows orange.
+    const heavyGlow =
+      this.state === "attack" && this.heavy && this.attackProgress < 0.62 ? 0.35 + 0.2 * Math.sin(this.clock * 20) : 0;
+    const poiseGlow = this.poiseTimer > 0 ? 0.22 + 0.1 * Math.sin(this.clock * 14) : 0;
+    const glow = Math.max(heavyGlow, poiseGlow);
     for (const mat of this.materials) {
-      mat.emissive.setRGB(this.flash * 0.9, this.flash * 0.12, this.flash * 0.08);
+      mat.emissive.setRGB(
+        this.flash * 0.9 + glow,
+        this.flash * 0.12 + (heavyGlow > 0 ? glow * 0.12 : glow * 0.45),
+        this.flash * 0.08,
+      );
+    }
+    this.wardFlash = Math.max(0, this.wardFlash - delta * 3);
+    if (this.ward.visible) {
+      const pulse = 0.85 + Math.sin(this.clock * 9) * 0.15 + this.wardFlash * 1.2;
+      for (const m of this.wardMaterials) m.opacity = (m.userData.base as number) * pulse;
+      this.ward.scale.setScalar(1 + this.wardFlash * 0.25);
     }
 
     if (this.state === "dead") {
@@ -781,6 +940,17 @@ class Enemy {
         if (this.stateTime > this.recoverDuration) this.setState("chase");
         break;
 
+      case "guard":
+        steer = false;
+        this.turnToward(dx, dz, delta, 9);
+        this.guardTimer -= delta;
+        // Two blocked blows, or the guard running out after one, earn a riposte.
+        if (this.guardBlocks >= 2 || this.guardTimer <= 0) {
+          if (this.guardBlocks > 0 && dist < ENEMY_REACH + 0.6 && !playerDown) this.startAttack(false, true);
+          else this.setState("chase");
+        }
+        break;
+
       case "hurt":
         steer = false;
         if (this.breakAway && this.stateTime > 0.18) {
@@ -821,6 +991,10 @@ class Enemy {
       mesh.geometry.dispose();
       (mesh.material as THREE.Material).dispose();
     }
+    this.ward.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) obj.geometry.dispose();
+    });
+    for (const material of this.wardMaterials) material.dispose();
   }
 
   /** Strafe around the player at a personal radius, switching direction now and then. */
@@ -973,7 +1147,8 @@ class Enemy {
     this.setState("evade");
   }
 
-  private startAttack(chained: boolean): void {
+  /** `riposte`: the quick answer after blocking; never a heavy. */
+  private startAttack(chained: boolean, riposte = false): void {
     const canPunch = this.actions.has("punch");
     const canKick = this.actions.has("kick");
     if (!canPunch && !canKick) {
@@ -986,16 +1161,18 @@ class Enemy {
     } else {
       this.attackClip = canPunch && (!canKick || Math.random() < 0.5) ? "punch" : "kick";
     }
-    this.comboUsed = chained;
+    this.heavy = !chained && !riposte && canPunch && Math.random() < this.traits.heavy;
+    if (this.heavy) this.attackClip = "punch";
+    this.comboUsed = chained || this.heavy;
     this.attackProgress = 0;
     this.attackLanded = false;
     this.whooshed = false;
     const action = this.actions.get(this.attackClip);
     if (action) {
       action.reset();
-      // Slightly varied tempo keeps the timing hard to read.
+      // Slightly varied tempo keeps the timing hard to read; a heavy is slow and obvious.
       const base = this.attackClip === "kick" ? 1.15 : 1.2;
-      action.timeScale = base * rand(0.9, 1.15) * (chained ? 1.1 : 1);
+      action.timeScale = this.heavy ? 0.62 : base * rand(0.9, 1.15) * (chained ? 1.1 : 1) * (riposte ? 1.25 : 1);
       action.play();
     }
     this.setState("attack");
@@ -1017,9 +1194,10 @@ class Enemy {
       const fx = Math.sin(this.group.rotation.y);
       const fz = Math.cos(this.group.rotation.y);
       const facing = dist > 1e-3 ? (dx * fx + dz * fz) / dist : 1;
-      if (dist < ENEMY_REACH && facing > 0.35 && p.y < 1.3) {
+      if (dist < ENEMY_REACH + (this.heavy ? 0.35 : 0) && facing > 0.35 && p.y < 1.3) {
         this.attackLanded = true;
-        player.takeHit(ENEMY_DAMAGE, pos.x, pos.z);
+        player.takeHit(this.heavy ? ENEMY_HEAVY_DAMAGE : ENEMY_DAMAGE, pos.x, pos.z);
+        if (this.heavy) this.sound("slam_impact", pos, 0.7);
       }
     }
     if (action && t < 0.92) return;
@@ -1133,6 +1311,7 @@ class Enemy {
   private setState(next: EnemyState): void {
     this.state = next;
     this.stateTime = 0;
+    this.ward.visible = next === "guard";
   }
 
   private blendTo(target: EnemyClip, delta: number): void {
@@ -1167,15 +1346,18 @@ class Enemy {
       (this.state === "leap" && this.stateTime < 0.35);
     this.glint.visible = windUp;
     if (windUp) {
+      const heavy = this.state === "attack" && this.heavy;
       const k = this.state === "attack" ? this.attackProgress / 0.4 : this.stateTime / 0.35;
-      const pulse = Math.sin(Math.min(k, 1) * Math.PI);
+      // A heavy's glint is red and holds at full size: there is no interrupting it.
+      const pulse = heavy ? Math.min(k * 3, 1) : Math.sin(Math.min(k, 1) * Math.PI);
       this.glint.material.opacity = pulse;
       this.glint.material.rotation = k * 1.6;
-      this.glint.scale.setScalar(0.35 + pulse * 0.45);
+      this.glint.material.color.setRGB(heavy ? 3.2 : 3, heavy ? 0.35 : 1.3, heavy ? 0.25 : 0.7);
+      this.glint.scale.setScalar(heavy ? 0.5 + pulse * 0.75 : 0.35 + pulse * 0.45);
     }
 
     // The bar lingers while fighting, then fades once they've been left alone.
-    const engaged = this.isEngaged() && this.hp < ENEMY_HP;
+    const engaged = this.isEngaged() && this.hp < this.traits.maxHp;
     this.barShown = engaged ? 1 : Math.max(0, this.barShown - delta * 0.6);
     this.bar.material.opacity = Math.min(1, this.barShown * 1.5) * 0.92;
     if (this.barDamage > 0) {
@@ -1189,7 +1371,7 @@ class Enemy {
     if (!ctx) return;
     const w = this.barCanvas.width;
     const h = this.barCanvas.height;
-    const frac = THREE.MathUtils.clamp(this.hp / ENEMY_HP, 0, 1);
+    const frac = THREE.MathUtils.clamp(this.hp / this.traits.maxHp, 0, 1);
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "rgba(10,8,8,0.8)";
     ctx.fillRect(0, 0, w, h);

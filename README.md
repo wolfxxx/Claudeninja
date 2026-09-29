@@ -40,7 +40,7 @@ animation-only GLBs. To rebuild them after changing a source Mixamo take, run
 **Combat feel**
 
 - **Punch → punch → roundhouse chain** on left click, with input buffering. The
-  roundhouse finisher hits for double damage and launches enemies.
+  roundhouse finisher hits for double damage. A strike that misses drops the chain.
 - **Aim assist and lunge**: each strike snaps toward the nearest enemy and closes the gap.
 - **Hit-stop, camera shake and FOV punch** scaled to how hard the blow was.
 - **Shadow Step**: roll just as an enemy's strike is about to land (watch for the
@@ -49,6 +49,22 @@ animation-only GLBs. To rebuild them after changing a source Mixamo take, run
 - **Combo meter** with ranks, **damage numbers**, **enemy health bars**, spark sprays,
   impact flashes, and dust on rolls, landings and sprints.
 - Slow-motion on the last kill of every wave.
+
+**Reading the fight** (mashing loses)
+
+- **Poise**: after three quick hits an enemy stops flinching, glows orange and swings
+  back. Only counters and the jump-attack slam still knock it down.
+- **Brawlers** wind up **heavy blows** — red glint, red glow, 26 damage. Your hits
+  won't stop them. Roll it (that's a Shadow Step) and counter.
+- **Duelists** raise a **blue ward** against strikes from the front. Blocked blows
+  knock you back, and two blocks earn a riposte. Counters, the slam, and hits from
+  behind break the guard.
+- **Acrobats** dodge jabs; the slam and the roundhouse sweep catch them.
+- **No regeneration**: kills drop a little health, counter blows drop more, and
+  clearing a wave heals 15%.
+- **Techniques**: after each wave, pick one of three upgrades with **1 / 2 / 3**.
+  Falling ends the run — upgrades are lost, the Red Clan starts again at wave 1, and
+  your best wave is remembered.
 
 **Visuals**
 
@@ -69,6 +85,7 @@ animation-only GLBs. To rebuild them after changing a source Mixamo take, run
 | Left click | Combo: punch, punch, roundhouse |
 | Right click | Jump attack |
 | Ctrl at the last moment | Shadow Step (perfect dodge → counter) |
+| 1 / 2 / 3 | Pick a technique between waves |
 | Mouse / Scroll | Look / zoom |
 | P or Esc | Pause |
 | M | Mute |
@@ -91,7 +108,8 @@ node tools/generate-music.mjs
 src/game/
 ├── Game.ts              # scene, lights, loop, HUD, hit-stop/slow-mo, combo
 ├── Player.ts            # hero movement, combo chain, counters, health, wading
-├── Enemies.ts           # Red Clan AI, waves, telegraphs, health bars
+├── Enemies.ts           # Red Clan AI, waves, telegraphs, guard, heavies, poise
+├── Upgrades.ts          # between-wave techniques and the pick overlay
 ├── CombatEffects.ts     # particles, impact flashes, damage numbers, dust
 ├── PostFX.ts            # bloom, colour grade, vignette, Shadow Step look
 ├── Sky.ts               # gradient sky dome and shared palette

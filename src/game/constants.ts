@@ -58,9 +58,11 @@ export const LOOK_AT_OFFSET_Y = 1.2;
 export const PLAYER_TURN_SPEED = 14;
 
 export const PLAYER_MAX_HP = 100;
-/** HP per second once the player hasn't been hit for PLAYER_REGEN_DELAY seconds. */
-export const PLAYER_REGEN = 5;
-export const PLAYER_REGEN_DELAY = 4;
+/** No passive regeneration: health comes back from orbs dropped by kills and counters. */
+export const ORB_HEAL_KILL = 3;
+export const ORB_HEAL_COUNTER = 4;
+/** Share of max HP restored when a wave is cleared. */
+export const WAVE_CLEAR_HEAL = 0.15;
 
 /** Player strikes: reach in metres from the player's feet, damage in enemy HP. */
 export const PUNCH_REACH = 2.0;
@@ -74,14 +76,15 @@ export const FINISHER_DAMAGE = 2;
 /** Seconds after a strike ends in which another click continues the chain. */
 export const COMBO_WINDOW = 0.5;
 /** Aim assist: strikes snap toward an enemy inside this radius and lunge to meet it. */
-export const STRIKE_ASSIST_RANGE = 4.2;
+export const STRIKE_ASSIST_RANGE = 3;
 /** Seconds a perfect dodge leaves your next strikes empowered. */
 export const COUNTER_WINDOW = 1.6;
 export const COUNTER_MULTIPLIER = 2;
 export const JUMP_HIT_REACH = 3.5;
 export const JUMP_HIT_DAMAGE = 2;
 export const ENEMY_HEIGHT = 1.78;
-export const ENEMY_HP = 4;
+/** HP on wave 1; enemies gain one more every two waves, up to +3. */
+export const ENEMY_HP = 5;
 export const ENEMY_SPEED = 4.3;
 /** Enemies notice the player inside this radius. */
 export const ENEMY_AGGRO_RANGE = 14;
@@ -89,9 +92,17 @@ export const ENEMY_AGGRO_RANGE = 14;
 export const ENEMY_ATTACK_RANGE = 1.45;
 /** ...and it connects if the player is still inside this one. */
 export const ENEMY_REACH = 1.85;
-export const ENEMY_DAMAGE = 12;
+export const ENEMY_DAMAGE = 14;
 /** Landing slam of an enemy's leaping jump attack. */
 export const ENEMY_LEAP_DAMAGE = 18;
+/** Brawler heavy strike: slow red wind-up that blows cannot interrupt. Roll it. */
+export const ENEMY_HEAVY_DAMAGE = 26;
+/** Hits in a quick streak before an enemy stops flinching and swings back. */
+export const ENEMY_POISE_HITS = 3;
+/** Seconds an enemy powers through jabs once its poise breaks. */
+export const ENEMY_POISE_TIME = 1.4;
+/** Seconds a duelist's guard stays up without being tested. */
+export const ENEMY_GUARD_TIME = 1.1;
 /** Enemies waiting for their turn circle the player at about this distance. */
 export const ENEMY_CIRCLE_RADIUS = 4.3;
 /** How many enemies may press the attack at once; the rest circle. */
@@ -99,6 +110,6 @@ export const ENEMY_MAX_ATTACKERS = 2;
 /** Enemies come in waves: 2, 3, 4… up to this many at once. */
 export const ENEMY_MAX_WAVE_SIZE = 5;
 /** Seconds of peace after loading before the first wave. */
-export const ENEMY_FIRST_WAVE_DELAY = 20;
-/** Seconds of peace after a wave is cleared. */
-export const ENEMY_WAVE_BREAK = 35;
+export const ENEMY_FIRST_WAVE_DELAY = 8;
+/** Seconds between picking an upgrade and the next wave. */
+export const ENEMY_WAVE_BREAK = 4;

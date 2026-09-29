@@ -177,9 +177,15 @@ const tmpVec = new THREE.Vector3();
 /** Fist height above the feet at full extension of the jab take. */
 const JAB_HEIGHT = 1.3;
 
+type Orb = { sprite: THREE.Sprite; vel: THREE.Vector3; age: number; heal: number };
+
 /** Short, readable attack cues built from geometry and particles, with no extra downloads. */
 export class CombatEffects {
   private readonly bursts: Burst[] = [];
+  private readonly orbs: Orb[] = [];
+  /** Healing orbs fly to this point (the player's feet); collected ones call onOrbCollect. */
+  orbTarget: THREE.Vector3 | null = null;
+  onOrbCollect: ((heal: number) => void) | null = null;
   private readonly sparks = new ParticlePool(700, true);
   private readonly dustPool = new ParticlePool(500, false);
 
@@ -275,8 +281,9 @@ export class CombatEffects {
     }
   }
 
-  slam(at: THREE.Vector3): void {
-    for (const [color, delay, end] of [[0xffc46c, 0, 3.5], [0xffede0, -0.07, 2.7]] as const) {
+  /** `scale` grows the shockwave with the slam's reach. */
+  slam(at: THREE.Vector3, scale = 1): void {
+    for (const [color, delay, end] of [[0xffc46c, 0, 3.5 * scale], [0xffede0, -0.07, 2.7 * scale]] as const) {
       const geometry = new THREE.RingGeometry(0.88, 1.05, 64);
       const material = new THREE.MeshBasicMaterial({
         color: new THREE.Color(color).multiplyScalar(1.8),
@@ -405,6 +412,59 @@ export class CombatEffects {
   }
 
   /** Puffs of dust at the feet: rolls, landings, sprint pushes. */
+  /** A strike glancing off a duelist's ward: cold sparks and a flash, no damage. */
+  block(at: THREE.Vector3): void {
+    for (let i = 0; i < 16; i++) {
+      tmpColor.setRGB(0.9 + Math.random() * 0.5, 1.5 + Math.random() * 0.4, 2.6);
+      this.sparks.emit(
+        at,
+        (Math.random() - 0.5) * 9,
+        1 + Math.random() * 4,
+        (Math.random() - 0.5) * 9,
+        tmpColor,
+        0.06 + Math.random() * 0.05,
+        0.18 + Math.random() * 0.2,
+        12,
+        3,
+      );
+    }
+    const flash = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: flashTexture(),
+        color: new THREE.Color(1.2, 1.8, 2.6),
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+      }),
+    );
+    flash.position.copy(at);
+    flash.renderOrder = 7;
+    this.scene.add(flash);
+    this.bursts.push({ mesh: flash, age: 0, life: 0.1, start: 0.4, end: 0.9, opacity: 0.9 });
+  }
+
+  /** Green motes that burst out of a fallen or countered enemy, then home in on the player. */
+  healOrbs(at: THREE.Vector3, total: number, count: number): void {
+    for (let i = 0; i < count; i++) {
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: flashTexture(),
+          color: new THREE.Color(0.7, 2.4, 1.0),
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          transparent: true,
+        }),
+      );
+      sprite.position.copy(at);
+      sprite.scale.setScalar(0.42);
+      sprite.renderOrder = 8;
+      this.scene.add(sprite);
+      const angle = Math.random() * Math.PI * 2;
+      const vel = new THREE.Vector3(Math.cos(angle) * 2.5, 3.5 + Math.random() * 2, Math.sin(angle) * 2.5);
+      this.orbs.push({ sprite, vel, age: -i * 0.05, heal: total / count });
+    }
+  }
+
   dust(at: THREE.Vector3, amount: number): void {
     const count = Math.round(8 + amount * 10);
     for (let i = 0; i < count; i++) {
@@ -419,6 +479,7 @@ export class CombatEffects {
   update(delta: number): void {
     this.sparks.update(delta);
     this.dustPool.update(delta);
+    this.updateOrbs(delta);
     for (let i = this.bursts.length - 1; i >= 0; i--) {
       const burst = this.bursts[i];
       burst.age += delta;
@@ -445,7 +506,46 @@ export class CombatEffects {
     }
   }
 
+  private updateOrbs(delta: number): void {
+    for (let i = this.orbs.length - 1; i >= 0; i--) {
+      const orb = this.orbs[i];
+      orb.age += delta;
+      const pos = orb.sprite.position;
+      if (orb.age < 0.4 || !this.orbTarget) {
+        // Pop out and hang for a beat so the reward reads.
+        orb.vel.y -= 14 * delta;
+        orb.vel.multiplyScalar(Math.exp(-3 * delta));
+      } else {
+        tmpVec.set(this.orbTarget.x, this.orbTarget.y + 1.1, this.orbTarget.z).sub(pos);
+        const dist = tmpVec.length();
+        if (dist < 0.45) {
+          tmpColor.setRGB(0.6, 2.2, 0.9);
+          for (let k = 0; k < 8; k++) {
+            this.sparks.emit(pos, (Math.random() - 0.5) * 4, Math.random() * 3, (Math.random() - 0.5) * 4, tmpColor, 0.07, 0.3, 4, 3);
+          }
+          this.onOrbCollect?.(orb.heal);
+          this.scene.remove(orb.sprite);
+          orb.sprite.material.dispose();
+          this.orbs.splice(i, 1);
+          continue;
+        }
+        // Accelerate harder the longer it has been flying, so it always arrives.
+        const pull = 30 + (orb.age - 0.4) * 60;
+        orb.vel.addScaledVector(tmpVec.divideScalar(dist), pull * delta);
+        orb.vel.multiplyScalar(Math.exp(-2.5 * delta));
+      }
+      pos.addScaledVector(orb.vel, delta);
+      pos.y = Math.max(0.2, pos.y);
+      orb.sprite.scale.setScalar(0.38 + Math.sin(orb.age * 18) * 0.06);
+    }
+  }
+
   dispose(): void {
+    for (const orb of this.orbs) {
+      this.scene.remove(orb.sprite);
+      orb.sprite.material.dispose();
+    }
+    this.orbs.length = 0;
     for (const burst of this.bursts) this.removeBurst(burst);
     this.bursts.length = 0;
     this.scene.remove(this.sparks.points, this.dustPool.points);

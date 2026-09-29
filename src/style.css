@@ -146,6 +146,7 @@ body {
   font-size: 34px;
   font-weight: 600;
   letter-spacing: 0.06em;
+  white-space: nowrap;
   color: #f2d6d0;
   text-shadow: 0 2px 12px rgba(80, 0, 0, 0.8);
   opacity: 0;
@@ -286,6 +287,114 @@ body {
   background: linear-gradient(90deg, transparent, #ffb070);
   transform-origin: right center;
   transform: scaleX(var(--combo-left));
+}
+
+#upgrades {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 240px;
+}
+
+#upgrades span {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: rgba(8, 12, 16, 0.55);
+  border: 1px solid rgba(255, 217, 138, 0.35);
+  color: #ffe2a8;
+}
+
+/* Between waves: three technique cards, picked with 1 / 2 / 3. */
+#upgrade-pick {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background: radial-gradient(ellipse at center, rgba(8, 12, 16, 0.35), rgba(8, 12, 16, 0.7));
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.25s ease, visibility 0.25s;
+}
+
+#upgrade-pick.is-visible {
+  opacity: 1;
+  visibility: visible;
+}
+
+#upgrade-pick h2 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #ffd98a;
+  text-shadow: 0 2px 14px rgba(0, 0, 0, 0.7);
+}
+
+#upgrade-pick > p {
+  margin: 0;
+  font-size: 14px;
+  opacity: 0.8;
+}
+
+.upgrade-cards {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 16px;
+  padding: 0 16px;
+}
+
+.upgrade-card {
+  position: relative;
+  width: 200px;
+  padding: 18px 16px 16px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(40, 26, 20, 0.92), rgba(16, 12, 12, 0.92));
+  border: 1px solid rgba(255, 217, 138, 0.35);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  text-align: center;
+}
+
+.upgrade-card strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 17px;
+  letter-spacing: 0.04em;
+  color: #ffe6c7;
+}
+
+.upgrade-card p {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+  opacity: 0.85;
+}
+
+.upgrade-glyph {
+  display: block;
+  font-size: 40px;
+  line-height: 1.1;
+  color: #ffd98a;
+  text-shadow: 0 0 18px rgba(255, 170, 60, 0.6);
+}
+
+.upgrade-key {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 22px;
+  background: rgba(255, 217, 138, 0.18);
+  color: #ffd98a;
 }
 
 /* Short centre callouts: Shadow Step, Counter!, Wave cleared. */

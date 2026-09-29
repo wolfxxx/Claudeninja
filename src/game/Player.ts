@@ -11,8 +11,6 @@ import {
   KICK_DAMAGE,
   KICK_REACH,
   PLAYER_MAX_HP,
-  PLAYER_REGEN,
-  PLAYER_REGEN_DELAY,
   LOOK_AT_OFFSET_Y,
   MOVE_ACCEL,
   MOVE_DECEL,
@@ -37,6 +35,7 @@ import {
 import type { SoundHook } from "./Audio";
 import type { Input } from "./Input";
 import type { WaterQuery } from "./Nature";
+import { freshMods, type Mods } from "./Upgrades";
 
 /** Metres travelled per footstep at the Mixamo run cadence. */
 const STEP_LENGTH = 2.1;
@@ -69,6 +68,8 @@ export type PlayerAttack = {
   finisher: boolean;
   /** Empowered by a perfect dodge. */
   counter: boolean;
+  /** Goes through a duelist's guard even from the front. */
+  breaksGuard: boolean;
 };
 
 /** Left-click chain. Falls back to kicks only until the jab take has loaded. */
@@ -108,6 +109,8 @@ export class Player {
   private slamTimer = 0;
   private kickWhooshed = false;
   private kickEffectPlayed = false;
+  /** The current strike hit something; only then can a queued click chain early. */
+  private strikeLanded = false;
   private stepDistance = 0;
   private stepFoot = 0;
   onSound: SoundHook | null = null;
@@ -118,10 +121,11 @@ export class Player {
   onDust: ((at: THREE.Vector3, amount: number) => void) | null = null;
   /** Aim assist: nearest living enemy position within `range`, supplied by the game. */
   findTarget: ((from: THREE.Vector3, range: number) => THREE.Vector3 | null) | null = null;
+  /** Upgrades picked this run. */
+  mods: Mods = freshMods();
   private hp = PLAYER_MAX_HP;
   private invulnTimer = 0;
   private stunTimer = 0;
-  private sinceHit = Infinity;
   /** Called whenever HP changes; `damaged` is true for hits, false for regen / respawn. */
   onHealthChange: ((hp: number, max: number, damaged: boolean) => void) | null = null;
   private collisionMeshes: THREE.Mesh[] = [];
@@ -264,9 +268,10 @@ export class Player {
           id: this.attackSerial,
           kind: "punch",
           reach: PUNCH_REACH,
-          damage: PUNCH_DAMAGE * mult,
+          damage: (PUNCH_DAMAGE + this.mods.punchDamage) * mult,
           finisher: false,
           counter: this.strikeCounter,
+          breaksGuard: this.strikeCounter,
         };
       }
       const finisher = this.isFinisher();
@@ -274,9 +279,10 @@ export class Player {
         id: this.attackSerial,
         kind: "kick",
         reach: KICK_REACH,
-        damage: (finisher ? FINISHER_DAMAGE : KICK_DAMAGE) * mult,
+        damage: (finisher ? FINISHER_DAMAGE + this.mods.finisherDamage : KICK_DAMAGE) * mult,
         finisher,
         counter: this.strikeCounter,
+        breaksGuard: this.strikeCounter || (finisher && this.mods.guardBreakKick),
       };
     }
     // Damage begins at impact, in sync with the visible ground shockwave.
@@ -284,10 +290,12 @@ export class Player {
       return {
         id: this.attackSerial,
         kind: "jumphit",
-        reach: JUMP_HIT_REACH,
-        damage: JUMP_HIT_DAMAGE * (this.strikeCounter ? COUNTER_MULTIPLIER : 1),
+        reach: JUMP_HIT_REACH + this.mods.slamReach,
+        damage: (JUMP_HIT_DAMAGE + this.mods.slamDamage) * (this.strikeCounter ? COUNTER_MULTIPLIER : 1),
         finisher: true,
         counter: this.strikeCounter,
+        // The ground shockwave comes from above: guards don't stop it.
+        breaksGuard: true,
       };
     }
     return null;
@@ -302,9 +310,28 @@ export class Player {
     this.group.rotation.y = Math.atan2(dx, dz);
   }
 
+  /** The game reports each strike that connected, so whiffs can be told apart. */
+  markStrikeLanded(attackId: number): void {
+    if (attackId === this.attackSerial) this.strikeLanded = true;
+  }
+
+  /** A strike bounced off a guard: knocked back, the chain broken. */
+  recoil(fromX: number, fromZ: number): void {
+    this.strike = null;
+    this.comboQueued = false;
+    this.comboWindow = 0;
+    this.comboStep = 0;
+    this.stunTimer = Math.max(this.stunTimer, 0.38);
+    const dx = this.group.position.x - fromX;
+    const dz = this.group.position.z - fromZ;
+    const len = Math.hypot(dx, dz) || 1;
+    this.velocity.x = (dx / len) * 5.5;
+    this.velocity.z = (dz / len) * 5.5;
+  }
+
   /** A perfect dodge: the next strikes started inside the window hit twice as hard. */
-  grantCounter(): void {
-    this.counterTimer = COUNTER_WINDOW;
+  grantCounter(seconds = COUNTER_WINDOW + this.mods.counterWindow): void {
+    this.counterTimer = Math.max(this.counterTimer, seconds);
     this.invulnTimer = Math.max(this.invulnTimer, 0.5);
   }
 
@@ -322,7 +349,17 @@ export class Player {
   }
 
   getHealth(): { hp: number; max: number } {
-    return { hp: this.hp, max: PLAYER_MAX_HP };
+    return { hp: this.hp, max: this.maxHp };
+  }
+
+  get maxHp(): number {
+    return PLAYER_MAX_HP + this.mods.maxHp;
+  }
+
+  heal(amount: number): void {
+    if (this.hp <= 0 || amount <= 0) return;
+    this.hp = Math.min(this.maxHp, this.hp + amount);
+    this.onHealthChange?.(this.hp, this.maxHp, false);
   }
 
   isDefeated(): boolean {
@@ -335,7 +372,6 @@ export class Player {
     this.hp = Math.max(0, this.hp - damage);
     this.invulnTimer = 0.6;
     this.stunTimer = 0.22;
-    this.sinceHit = 0;
     this.strike = null;
     this.comboQueued = false;
     this.comboWindow = 0;
@@ -348,7 +384,7 @@ export class Player {
 
     this.onSound?.("hit_player", this.group.position);
     this.onSound?.("player_hurt", this.group.position);
-    this.onHealthChange?.(this.hp, PLAYER_MAX_HP, true);
+    this.onHealthChange?.(this.hp, this.maxHp, true);
     return true;
   }
 
@@ -356,16 +392,15 @@ export class Player {
     this.group.position.set(PLAYER_START.x, PLAYER_START.y, PLAYER_START.z);
     this.group.rotation.set(0, Math.PI, 0);
     this.velocity.set(0, 0, 0);
-    this.hp = PLAYER_MAX_HP;
+    this.hp = this.maxHp;
     this.invulnTimer = 1.5;
     this.stunTimer = 0;
-    this.sinceHit = Infinity;
     this.rolling = false;
     this.strike = null;
     this.comboQueued = false;
     this.counterTimer = 0;
     this.jumpAttacking = false;
-    this.onHealthChange?.(this.hp, PLAYER_MAX_HP, false);
+    this.onHealthChange?.(this.hp, this.maxHp, false);
   }
 
   update(delta: number, input: Input, camera: THREE.Camera): void {
@@ -416,11 +451,6 @@ export class Player {
     if (!this.strike) this.comboWindow = Math.max(0, this.comboWindow - delta);
     this.invulnTimer = Math.max(0, this.invulnTimer - delta);
     this.stunTimer = Math.max(0, this.stunTimer - delta);
-    this.sinceHit += delta;
-    if (this.hp > 0 && this.hp < PLAYER_MAX_HP && this.sinceHit > PLAYER_REGEN_DELAY) {
-      this.hp = Math.min(PLAYER_MAX_HP, this.hp + PLAYER_REGEN * delta);
-      this.onHealthChange?.(this.hp, PLAYER_MAX_HP, false);
-    }
   }
 
   /**
@@ -899,12 +929,13 @@ export class Player {
     this.strikeCounter = this.counterTimer > 0;
     this.kickWhooshed = false;
     this.kickEffectPlayed = false;
+    this.strikeLanded = false;
     this.attackSerial++;
 
     const pos = this.group.position;
     // A primed counter turns the strike into a shadow dash that closes much longer gaps.
     const dash = this.strikeCounter;
-    const target = this.findTarget?.(pos, dash ? STRIKE_ASSIST_RANGE * 1.9 : STRIKE_ASSIST_RANGE) ?? null;
+    const target = this.findTarget?.(pos, dash ? STRIKE_ASSIST_RANGE * 2.7 : STRIKE_ASSIST_RANGE) ?? null;
     let lunge = kind === "kick" ? 2.2 : 3;
     if (target) {
       const dx = target.x - pos.x;
@@ -953,8 +984,9 @@ export class Player {
     }
 
     // A queued jab follows as soon as this blow has landed; the roundhouse must finish.
+    // A whiff can't be cancelled early and drops the chain: mashing at air is slow.
     const cancelAt = phases.end;
-    if (this.comboQueued && t >= phases.chainAt) {
+    if (this.comboQueued && this.strikeLanded && t >= phases.chainAt) {
       this.strike = null;
       if (this.model) this.model.rotation.y = this.modelBaseRotationY;
       this.startStrike();
@@ -962,6 +994,11 @@ export class Player {
     }
     if (!action.isRunning() || t >= cancelAt) {
       this.strike = null;
+      if (!this.strikeLanded) {
+        this.comboQueued = false;
+        this.comboWindow = 0;
+        return;
+      }
       // After the finisher the chain restarts from the first jab.
       this.comboWindow = this.comboStep === COMBO.length - 1 ? 0 : COMBO_WINDOW;
     }
